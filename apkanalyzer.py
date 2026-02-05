@@ -54,14 +54,35 @@ def adb_shell(cmd, timeout=30):
     """Run adb shell command (non-root)."""
     return adb(f'shell "{cmd}"', timeout=timeout)
 
+# Root mode: "su" = use su -c, "adbd" = adb shell already root, None = unknown
+_root_mode = None
+
 def adb_su(cmd, timeout=30):
-    """Run adb shell su -c command (root)."""
+    """Run command as root, auto-detecting whether su or adbd-root is available."""
+    global _root_mode
+    if _root_mode == "adbd":
+        return adb_shell(cmd, timeout=timeout)
+    # Default: try su -c
     escaped = cmd.replace('"', '\\"')
     return adb(f'shell su -c "{escaped}"', timeout=timeout)
 
 
 def _shell_su(cmd, timeout=30):
     """Run a compound command as root (handles &&, |, etc.)."""
+    global _root_mode
+    if _root_mode == "adbd":
+        try:
+            r = subprocess.run(
+                ["adb", "shell", cmd],
+                stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=timeout,
+                encoding='utf-8', errors='replace'
+            )
+            return r.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT]"
+        except Exception as e:
+            return f"[ERROR] {e}"
     escaped = cmd.replace("'", "'\\''")
     try:
         r = subprocess.run(
@@ -107,9 +128,20 @@ def check_device():
     return {"serial": serial, "model": model, "android": android_ver, "sdk": sdk}
 
 def check_root():
-    """Check if device has root access."""
-    out = adb_su("id")
-    return "uid=0" in out
+    """Check if device has root access (su or adbd-root)."""
+    global _root_mode
+    # Try su first
+    out = adb(f'shell su -c "id"', timeout=10)
+    if "uid=0" in out:
+        _root_mode = "su"
+        return True
+    # Fallback: check if adb shell itself is root (emulators, adb root)
+    out = adb_shell("id", timeout=10)
+    if "uid=0" in out:
+        _root_mode = "adbd"
+        return True
+    _root_mode = None
+    return False
 
 def list_third_party_apps():
     """List all third-party (user-installed) apps."""
