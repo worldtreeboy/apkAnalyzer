@@ -114,6 +114,24 @@ Both **Storage Audit** and **Security Scan** use ~40 regex patterns to catch har
 
 ---
 
+## Custom Frida Script
+
+`frida_scripts/universal_bypass.js` — a single all-in-one script that bypasses SSL pinning, root detection, and runtime tampering simultaneously. More comprehensive than any individual CodeShare script.
+
+```bash
+frida -U -f <package> -l frida_scripts/universal_bypass.js
+```
+
+| Layer | What It Bypasses |
+|-------|-----------------|
+| **SSL Pinning** | TrustManager, TrustManagerFactory, HostnameVerifier, OkHttp3 CertificatePinner, Conscrypt, TrustKit, WebView SSL, Flutter BoringSSL, Apache HTTP |
+| **Root Detection** | File.exists (30+ paths), PackageManager (20+ root packages), Runtime.exec, ProcessBuilder, Build.TAGS, SystemProperties, RootBeer library, native fopen/access |
+| **Runtime Tampering** | Anti-Frida (port 27042, /proc/maps, string detection), anti-debug (ptrace, isDebuggerConnected), System.exit blocking, emulator detection, Xposed detection, process kill prevention |
+
+Every hook is wrapped in try/catch — if a class isn't present, it silently skips instead of crashing.
+
+---
+
 ## Frida CodeShare (38 Scripts)
 
 Auto-starts `frida-server` on device. Run scripts from local files or the built-in library:
