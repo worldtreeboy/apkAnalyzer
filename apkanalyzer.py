@@ -1059,31 +1059,35 @@ def storage_audit(pkg):
             print(f"\n    {C.CYAN}📄 {fname}{C.RST} {C.DIM}({fsize} bytes){C.RST}{sdk_tag}{enc_tag}")
 
             if content and not content.startswith("[") and not is_encrypted:
-                # Parse and display key-value pairs for app-specific files
-                if not is_sdk:
-                    # Extract key-value pairs from XML
-                    kv_pairs = []
-                    for m in re.finditer(r'<(string|int|long|float|boolean|set)\s+name="([^"]+)"[^>]*>([^<]*)</', content):
-                        ktype, kname, kval = m.groups()
-                        kv_pairs.append((ktype, kname, kval.strip()))
-                    # Also match self-closing boolean tags
-                    for m in re.finditer(r'<boolean\s+name="([^"]+)"\s+value="([^"]+)"', content):
-                        kv_pairs.append(('boolean', m.group(1), m.group(2)))
+                # Always show raw XML content (first 10 lines)
+                raw_lines = content.splitlines()
+                preview_count = min(10, len(raw_lines))
+                if preview_count > 0:
+                    print(f"      {C.WHITE}Content ({len(raw_lines)} lines, showing first {preview_count}):{C.RST}")
+                    for rline in raw_lines[:preview_count]:
+                        print(f"        {C.DIM}{rline.rstrip()}{C.RST}")
+                    if len(raw_lines) > 10:
+                        print(f"        {C.DIM}... ({len(raw_lines) - 10} more lines){C.RST}")
 
-                    if kv_pairs:
-                        print(f"      {C.WHITE}Key-Value Pairs ({len(kv_pairs)}):{C.RST}")
-                        for ktype, kname, kval in kv_pairs[:15]:  # Show first 15
-                            # Truncate long values
-                            display_val = kval[:50] + "..." if len(kval) > 50 else kval
-                            # Highlight sensitive-looking keys
-                            sensitive_keys = ['token', 'key', 'secret', 'password', 'auth', 'session', 'jwt', 'credential', 'pin', 'otp']
-                            is_sensitive = any(sk in kname.lower() for sk in sensitive_keys)
-                            if is_sensitive:
-                                print(f"        {C.RED}• {kname}{C.RST} = {C.RED}{display_val}{C.RST} {C.DIM}({ktype}){C.RST}")
-                            else:
-                                print(f"        {C.DIM}• {kname}{C.RST} = {display_val} {C.DIM}({ktype}){C.RST}")
-                        if len(kv_pairs) > 15:
-                            print(f"        {C.DIM}... and {len(kv_pairs) - 15} more entries{C.RST}")
+                # Extract and highlight key-value pairs
+                kv_pairs = []
+                # Tags with content: <string name="X">val</string>
+                for m in re.finditer(r'<(string|int|long|float|boolean|set)\s+name="([^"]+)"[^>]*>([^<]*)</', content):
+                    ktype, kname, kval = m.groups()
+                    kv_pairs.append((ktype, kname, kval.strip()))
+                # Self-closing tags: <boolean name="X" value="Y" />, <float name="X" value="Y" />
+                for m in re.finditer(r'<(boolean|int|long|float)\s+name="([^"]+)"\s+value="([^"]+)"', content):
+                    kv_pairs.append((m.group(1), m.group(2), m.group(3)))
+
+                if kv_pairs:
+                    sensitive_keys = ['token', 'key', 'secret', 'password', 'auth', 'session', 'jwt', 'credential', 'pin', 'otp']
+                    flagged = [(ktype, kname, kval) for ktype, kname, kval in kv_pairs
+                               if any(sk in kname.lower() for sk in sensitive_keys)]
+                    if flagged:
+                        print(f"      {C.RED}Sensitive Keys Found ({len(flagged)}):{C.RST}")
+                        for ktype, kname, kval in flagged[:10]:
+                            display_val = kval[:80] + "..." if len(kval) > 80 else kval
+                            print(f"        {C.RED}⚠ {kname}{C.RST} = {C.RED}{display_val}{C.RST} {C.DIM}({ktype}){C.RST}")
 
                 # Check for secrets
                 for pattern in SECRET_PATTERNS:
