@@ -3197,6 +3197,9 @@ def fun_testcases(pkg):
 GADGET_URL = "https://github.com/frida/frida/releases/download/17.6.2/frida-gadget-17.6.2-android-arm64.so.xz"
 GADGET_SO_NAME = "libfrida-gadget.so"
 
+LSPATCH_URL = "https://github.com/LSPosed/LSPatch/releases/download/v0.6/jar-v0.6-398-release.jar"
+LSPATCH_JAR_NAME = "lspatch.jar"
+
 def _find_apktool():
     """Find apktool — standalone command or java -jar fallback."""
     if shutil.which("apktool"):
@@ -3624,6 +3627,128 @@ def frida_gadget_patch(pkg):
     pause()
 
 
+# ─── LSPatch APK Patcher ─────────────────────────────────────────────────────────
+
+def lspatch_patch(pkg):
+    """Patch APK with LSPatch for Xposed/LSPosed module loading."""
+    section("LSPATCH APK PATCHER")
+
+    # ── Check dependencies ───────────────────────────────────────────────
+    if not shutil.which("java"):
+        print(f"  {C.RED}[!] java not found — JDK/JRE is required for LSPatch.{C.RST}")
+        print(f"  {C.DIM}  Install a JDK (e.g. openjdk-17-jdk) and ensure java is on PATH{C.RST}")
+        pause()
+        return
+
+    print(f"  {C.GREEN}[+] java : {shutil.which('java')}{C.RST}")
+
+    # ── Setup directories ────────────────────────────────────────────────
+    gadget_cache = os.path.join(os.getcwd(), ".gadget_cache")
+    patched_dir = os.path.join(os.getcwd(), "patched_apks")
+    os.makedirs(gadget_cache, exist_ok=True)
+    os.makedirs(patched_dir, exist_ok=True)
+
+    # ── Download LSPatch jar if not cached ───────────────────────────────
+    lspatch_jar = os.path.join(gadget_cache, LSPATCH_JAR_NAME)
+    if not os.path.isfile(lspatch_jar):
+        print(f"\n  {C.CYAN}[*] Downloading LSPatch jar...{C.RST}")
+        print(f"  {C.DIM}{LSPATCH_URL}{C.RST}")
+        try:
+            urllib.request.urlretrieve(LSPATCH_URL, lspatch_jar)
+        except Exception as e:
+            print(f"  {C.RED}[!] Download failed: {e}{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] LSPatch jar downloaded{C.RST}")
+    else:
+        print(f"\n  {C.GREEN}[+] Using cached LSPatch jar{C.RST}")
+
+    # ── Locate APK ───────────────────────────────────────────────────────
+    local_apk = None
+    for search_dir in [os.path.join(os.getcwd(), "extracted_apks"), os.getcwd()]:
+        if not os.path.isdir(search_dir):
+            continue
+        for root, dirs, files in os.walk(search_dir):
+            if ".apkanalyzer_tmp" in root or ".apkpatcher_work" in root:
+                continue
+            for fname in files:
+                if fname.endswith(".apk") and pkg in fname:
+                    candidate = os.path.join(root, fname)
+                    if os.path.getsize(candidate) > 0:
+                        local_apk = candidate
+                        break
+            if local_apk:
+                break
+        if local_apk:
+            break
+
+    if local_apk:
+        print(f"  {C.GREEN}[+] Found local APK: {local_apk}{C.RST}")
+    else:
+        apk_path = get_apk_path(pkg)
+        if not apk_path:
+            print(f"  {C.RED}[!] Could not locate APK for {pkg}{C.RST}")
+            pause()
+            return
+        work_dir = os.path.join(os.getcwd(), ".apkpatcher_work")
+        os.makedirs(work_dir, exist_ok=True)
+        local_apk = os.path.join(work_dir, f"{pkg}.apk")
+        print(f"\n  {C.DIM}Pulling APK from device...{C.RST}")
+        adb_pull(apk_path, local_apk)
+        if not os.path.exists(local_apk) or os.path.getsize(local_apk) == 0:
+            print(f"  {C.RED}[!] Failed to pull APK.{C.RST}")
+            pause()
+            return
+
+    # ── Run LSPatch ──────────────────────────────────────────────────────
+    print(f"\n  {C.CYAN}[*] Running LSPatch...{C.RST}")
+    print(f"  {C.DIM}  -d (debuggable)  -v (verbose)  -l 2 (sig-bypass level 2){C.RST}")
+    try:
+        r = subprocess.run(
+            f'java -jar "{lspatch_jar}" "{local_apk}" -d -v -l 2 -o "{patched_dir}"',
+            shell=True, capture_output=True, text=True, timeout=300,
+            encoding='utf-8', errors='replace'
+        )
+        print(f"  {C.DIM}{r.stdout[-800:] if r.stdout else ''}{C.RST}")
+        if r.returncode != 0:
+            print(f"  {C.RED}[!] LSPatch failed (exit {r.returncode}):{C.RST}")
+            print(f"  {C.DIM}{r.stderr[:600] if r.stderr else 'unknown error'}{C.RST}")
+            pause()
+            return
+    except subprocess.TimeoutExpired:
+        print(f"  {C.RED}[!] LSPatch timed out.{C.RST}")
+        pause()
+        return
+
+    print(f"\n  {C.GREEN}{C.BOLD}{'='*50}{C.RST}")
+    print(f"  {C.GREEN}{C.BOLD}[✓] LSPATCH COMPLETE{C.RST}")
+    print(f"  {C.GREEN}{C.BOLD}{'='*50}{C.RST}")
+    print(f"  {C.WHITE}Output directory: {patched_dir}{C.RST}")
+    print(f"\n  {C.CYAN}To install:{C.RST}")
+    print(f"  {C.DIM}  adb uninstall {pkg}{C.RST}")
+    print(f'  {C.DIM}  adb install "<patched_apk_from_output_dir>"{C.RST}')
+    print(f"\n  {C.CYAN}The patched APK can load LSPosed/Xposed modules without root.{C.RST}")
+    pause()
+
+
+# ─── Binary Patcher (sub-menu) ───────────────────────────────────────────────────
+
+def binary_patcher(pkg):
+    """Sub-menu: choose between Frida Gadget and LSPatch patching."""
+    section("BINARY PATCHER")
+    print(f"  {C.CYAN}Choose a patching method:{C.RST}\n")
+    print(f"  {C.YELLOW}[1]{C.RST} Frida Gadget  — inject frida-gadget.so (Frida hooking)")
+    print(f"  {C.YELLOW}[2]{C.RST} LSPatch       — embed LSPosed/Xposed framework (Xposed modules)")
+    print(f"  {C.YELLOW}[0]{C.RST} Back\n")
+    ch = input(f"  {C.WHITE}Select [{C.YELLOW}1{C.WHITE}/{C.YELLOW}2{C.WHITE}/{C.YELLOW}0{C.WHITE}]: {C.RST}").strip()
+    if ch == "1":
+        frida_gadget_patch(pkg)
+    elif ch == "2":
+        lspatch_patch(pkg)
+    else:
+        return
+
+
 # ─── Frida Server Config ─────────────────────────────────────────────────────────
 
 def frida_server_config():
@@ -3721,8 +3846,8 @@ def main_menu(device_info, has_root, selected_pkg):
   ║  {C.YELLOW}[7]{C.CYAN} Logcat Live Monitor                 ║
   ║      {C.DIM}Filter logcat output in real-time{C.RST}{C.CYAN}   ║
   ║  {C.YELLOW}[8]{C.CYAN} Frida CodeShare                     ║
-  ║  {C.YELLOW}[9]{C.CYAN} Frida Gadget Patcher                ║
-  ║      {C.DIM}Patch APK with frida-gadget .so{C.RST}{C.CYAN}      ║
+  ║  {C.YELLOW}[9]{C.CYAN} Binary Patcher                      ║
+  ║      {C.DIM}Frida Gadget or LSPatch (Xposed){C.RST}{C.CYAN}    ║
   ║  {C.YELLOW}[10]{C.CYAN} Frida Server Config                ║
   ║  {C.YELLOW}[11]{C.CYAN} MASVS-STORAGE Assessment           ║
   ║      {C.DIM}OWASP Data Storage L1 (10 checks){C.RST}{C.CYAN}   ║
@@ -3820,7 +3945,7 @@ def main():
         elif choice == "8":
             frida_codeshare(selected_pkg)
         elif choice == "9":
-            frida_gadget_patch(selected_pkg)
+            binary_patcher(selected_pkg)
         elif choice == "10":
             frida_server_config()
         elif choice == "11":

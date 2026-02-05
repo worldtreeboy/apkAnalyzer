@@ -22,7 +22,7 @@ Interactive terminal menu for app analysis, storage auditing, shell access, scre
 | 6 | **Keyboard Cache Detection** | Check if LokiBoard keyboard caches user input in plaintext. Prompts user to type in the app, then searches all `lokiboard_files_*.txt` cache files for the entered text |
 | 7 | **Logcat Live Monitor** | Stream `adb logcat` in real-time filtered by a search string. Matched text highlighted in bold red. Ctrl+C to stop |
 | 8 | **Frida CodeShare** | Auto-start frida-server (USB default), run local bypass scripts or 38 grouped CodeShare scripts (see below) |
-| 9 | **Frida Gadget Patcher** | Patch APK with Frida Gadget for non-root dynamic analysis — auto-downloads gadget, injects loader, re-signs (see below) |
+| 9 | **Binary Patcher** | Sub-menu: Frida Gadget (inject frida-gadget.so) or LSPatch (embed LSPosed/Xposed framework) — see below |
 | 10 | **Frida Server Config** | Switch between USB (`-U`) and custom host:port (`-H ip:port`), restart/kill frida-server, set up ADB port forwarding |
 | 11 | **MASVS-STORAGE Assessment** | OWASP MASVS-STORAGE L1 compliance — 10 test cases across static + dynamic analysis (see below) |
 | 12 | **Testcases for Fun** | Launch exported activities/services/receivers, clipboard spy, dev/staging URL finder (see below) |
@@ -98,9 +98,13 @@ Detection scans decompile the APK once and cache the output in `.apkanalyzer_tmp
 python3 apkanalyzer.py
 ```
 
-### Frida Gadget Patcher (Option 9)
+### Binary Patcher (Option 9)
 
-Patches the selected APK with [Frida Gadget](https://frida.re/docs/gadget/) for dynamic analysis on non-rooted devices.
+Sub-menu with two patching methods for non-rooted devices:
+
+#### [1] Frida Gadget
+
+Patches the selected APK with [Frida Gadget](https://frida.re/docs/gadget/) for dynamic analysis.
 
 **Pipeline:**
 
@@ -118,6 +122,23 @@ Patches the selected APK with [Frida Gadget](https://frida.re/docs/gadget/) for 
 | 10 | **Sign** with auto-generated debug keystore (+ zipalign if available) |
 
 Output saved to `patched_apks/<pkg>_gadget_patched.apk`.
+
+#### [2] LSPatch
+
+Patches the selected APK with [LSPatch](https://github.com/LSPosed/LSPatch) to embed the LSPosed/Xposed framework — load Xposed modules without root.
+
+**Pipeline:**
+
+| Step | Action |
+|------|--------|
+| 1 | **Check dependency** — `java` (JDK/JRE) |
+| 2 | **Download LSPatch jar** — `jar-v0.6-398-release.jar` from GitHub releases (cached in `.gadget_cache/`) |
+| 3 | **Get APK** — uses local copy from `extracted_apks/` or pulls from device |
+| 4 | **Run LSPatch** — `java -jar lspatch.jar <apk> -d -v -l 2 -o patched_apks/` |
+
+Flags: `-d` (debuggable), `-v` (verbose), `-l 2` (signature bypass level 2).
+
+Output saved to `patched_apks/`.
 
 ### MASVS-STORAGE Assessment (Option 11)
 
@@ -190,5 +211,5 @@ Interactive sub-menu with 5 test cases for hands-on exploration of app attack su
 - Extracted APKs saved to `./extracted_apks/`
 - Patched APKs saved to `./patched_apks/`
 - Screenshots saved to `./screenshots/`
-- Frida Gadget cached in `./.gadget_cache/`
+- Frida Gadget & LSPatch jar cached in `./.gadget_cache/`
 - Decompiled cache saved to `./.apkanalyzer_tmp/`
