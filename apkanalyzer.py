@@ -11,6 +11,8 @@ import os
 import re
 import time
 import shutil
+import lzma
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -3190,6 +3192,438 @@ def fun_testcases(pkg):
             print(f"  {C.RED}Invalid option.{C.RST}")
             time.sleep(0.5)
 
+# ─── Frida Gadget APK Patcher ────────────────────────────────────────────────────
+
+GADGET_URL = "https://github.com/frida/frida/releases/download/17.6.2/frida-gadget-17.6.2-android-arm64.so.xz"
+GADGET_SO_NAME = "libfrida-gadget.so"
+
+def _find_apktool():
+    """Find apktool — standalone command or java -jar fallback."""
+    if shutil.which("apktool"):
+        return "apktool"
+    for jar_path in [
+        os.path.join(os.getcwd(), "apktool.jar"),
+        os.path.join(os.path.expanduser("~"), "apktool.jar"),
+    ]:
+        if os.path.isfile(jar_path):
+            if shutil.which("java"):
+                return f'java -jar "{jar_path}"'
+    return None
+
+def _find_main_activity(manifest_path):
+    """Parse AndroidManifest.xml to find the launcher activity."""
+    try:
+        tree = ET.parse(manifest_path)
+        root = tree.getroot()
+        ns = "http://schemas.android.com/apk/res/android"
+        package = root.get("package", "")
+
+        for activity in root.iter("activity"):
+            for intent_filter in activity.iter("intent-filter"):
+                actions = [a.get(f"{{{ns}}}name") for a in intent_filter.iter("action")]
+                categories = [c.get(f"{{{ns}}}name") for c in intent_filter.iter("category")]
+                if ("android.intent.action.MAIN" in actions
+                        and "android.intent.category.LAUNCHER" in categories):
+                    name = activity.get(f"{{{ns}}}name", "")
+                    if name.startswith("."):
+                        name = package + name
+                    elif "." not in name:
+                        name = package + "." + name
+                    return name
+    except Exception as e:
+        print(f"  {C.RED}[!] Manifest parse error: {e}{C.RST}")
+    return None
+
+def _patch_manifest_for_gadget(manifest_path):
+    """Add INTERNET permission and set extractNativeLibs=true."""
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Add INTERNET permission if missing
+        if 'android.permission.INTERNET' not in content:
+            content = content.replace(
+                '<application',
+                '<uses-permission android:name="android.permission.INTERNET"/>\n    <application',
+                1
+            )
+            print(f"  {C.GREEN}[+] Added INTERNET permission{C.RST}")
+
+        # Set extractNativeLibs="true" so injected .so gets extracted
+        if 'extractNativeLibs="false"' in content:
+            content = content.replace('extractNativeLibs="false"', 'extractNativeLibs="true"')
+            print(f"  {C.GREEN}[+] Set extractNativeLibs=true{C.RST}")
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"  {C.RED}[!] Manifest patch error: {e}{C.RST}")
+        return False
+
+def _inject_gadget_loader(smali_path):
+    """Inject System.loadLibrary('frida-gadget') into smali class."""
+    try:
+        with open(smali_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        load_lines = [
+            '    const-string v0, "frida-gadget"',
+            '',
+            '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V',
+        ]
+
+        if ".method static constructor <clinit>()V" in content:
+            # Inject into existing <clinit>
+            lines = content.split('\n')
+            new_lines = []
+            in_clinit = False
+            injected = False
+            for line in lines:
+                new_lines.append(line)
+                if ".method static constructor <clinit>()V" in line:
+                    in_clinit = True
+                if in_clinit and not injected:
+                    stripped = line.strip()
+                    if stripped.startswith(".locals") or stripped.startswith(".registers"):
+                        # Ensure at least 1 register
+                        parts = stripped.split()
+                        if len(parts) == 2 and int(parts[1]) < 1:
+                            new_lines[-1] = line.replace(f"{parts[0]} 0", f"{parts[0]} 1")
+                        new_lines.extend(load_lines)
+                        injected = True
+            if injected:
+                content = '\n'.join(new_lines)
+            else:
+                return False
+
+        elif "onCreate(Landroid/os/Bundle;)V" in content:
+            # Inject into onCreate
+            lines = content.split('\n')
+            new_lines = []
+            in_oncreate = False
+            injected = False
+            for line in lines:
+                new_lines.append(line)
+                if "onCreate(Landroid/os/Bundle;)V" in line and ".method" in line:
+                    in_oncreate = True
+                if in_oncreate and not injected:
+                    stripped = line.strip()
+                    if stripped.startswith(".locals") or stripped.startswith(".registers"):
+                        parts = stripped.split()
+                        if len(parts) == 2:
+                            n = int(parts[1])
+                            if stripped.startswith(".locals") and n < 1:
+                                new_lines[-1] = line.replace(".locals 0", ".locals 1")
+                            elif stripped.startswith(".registers") and n < 1:
+                                new_lines[-1] = line.replace(".registers 0", ".registers 1")
+                        new_lines.extend(load_lines)
+                        injected = True
+            if injected:
+                content = '\n'.join(new_lines)
+            else:
+                return False
+        else:
+            # No <clinit> or onCreate — add a new <clinit>
+            clinit_block = (
+                '\n.method static constructor <clinit>()V\n'
+                '    .registers 1\n'
+                '\n'
+                '    const-string v0, "frida-gadget"\n'
+                '\n'
+                '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+                '\n'
+                '    return-void\n'
+                '.end method\n'
+            )
+            if "\n.method " in content:
+                idx = content.index("\n.method ") + 1
+                content = content[:idx] + clinit_block + "\n" + content[idx:]
+            else:
+                content += "\n" + clinit_block
+
+        with open(smali_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"  {C.RED}[!] Smali injection error: {e}{C.RST}")
+        return False
+
+
+def frida_gadget_patch(pkg):
+    """Patch APK with Frida Gadget for non-root dynamic analysis."""
+    section("FRIDA GADGET APK PATCHER")
+
+    # ── Check dependencies ───────────────────────────────────────────────
+    apktool_cmd = _find_apktool()
+    if not apktool_cmd:
+        print(f"  {C.RED}[!] apktool not found.{C.RST}")
+        print(f"  {C.DIM}  Install: https://ibotpeaches.github.io/Apktool/{C.RST}")
+        print(f"  {C.DIM}  Or place apktool.jar in current directory and ensure java is installed{C.RST}")
+        pause()
+        return
+
+    signer = None
+    if shutil.which("apksigner"):
+        signer = "apksigner"
+    elif shutil.which("jarsigner"):
+        signer = "jarsigner"
+    else:
+        print(f"  {C.RED}[!] No signing tool found (apksigner or jarsigner).{C.RST}")
+        print(f"  {C.DIM}  Install JDK for jarsigner or Android SDK build-tools for apksigner{C.RST}")
+        pause()
+        return
+
+    if not shutil.which("keytool"):
+        print(f"  {C.RED}[!] keytool not found — JDK is required for keystore generation.{C.RST}")
+        pause()
+        return
+
+    print(f"  {C.GREEN}[+] apktool : {apktool_cmd}{C.RST}")
+    print(f"  {C.GREEN}[+] signer  : {signer}{C.RST}")
+
+    # ── Setup directories ────────────────────────────────────────────────
+    work_dir = os.path.join(os.getcwd(), ".apkpatcher_work")
+    patched_dir = os.path.join(os.getcwd(), "patched_apks")
+    gadget_cache = os.path.join(os.getcwd(), ".gadget_cache")
+    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(patched_dir, exist_ok=True)
+    os.makedirs(gadget_cache, exist_ok=True)
+
+    try:
+        # ── Step 1: Download Frida Gadget ────────────────────────────────
+        gadget_so = os.path.join(gadget_cache, GADGET_SO_NAME)
+        if not os.path.isfile(gadget_so):
+            gadget_xz = os.path.join(gadget_cache, "frida-gadget.so.xz")
+            print(f"\n  {C.CYAN}[*] Downloading Frida Gadget...{C.RST}")
+            print(f"  {C.DIM}{GADGET_URL}{C.RST}")
+            try:
+                urllib.request.urlretrieve(GADGET_URL, gadget_xz)
+            except Exception as e:
+                print(f"  {C.RED}[!] Download failed: {e}{C.RST}")
+                pause()
+                return
+
+            print(f"  {C.DIM}Extracting...{C.RST}")
+            try:
+                with lzma.open(gadget_xz) as f_in:
+                    with open(gadget_so, "wb") as f_out:
+                        f_out.write(f_in.read())
+                os.remove(gadget_xz)
+            except Exception as e:
+                print(f"  {C.RED}[!] Extraction failed: {e}{C.RST}")
+                pause()
+                return
+            print(f"  {C.GREEN}[+] Frida Gadget downloaded{C.RST}")
+        else:
+            print(f"\n  {C.GREEN}[+] Using cached Frida Gadget{C.RST}")
+
+        # ── Step 2: Get APK ──────────────────────────────────────────────
+        local_apk = None
+        for search_dir in [os.path.join(os.getcwd(), "extracted_apks"), os.getcwd()]:
+            if not os.path.isdir(search_dir):
+                continue
+            for root, dirs, files in os.walk(search_dir):
+                if ".apkanalyzer_tmp" in root or ".apkpatcher_work" in root:
+                    continue
+                for fname in files:
+                    if fname.endswith(".apk") and pkg in fname:
+                        candidate = os.path.join(root, fname)
+                        if os.path.getsize(candidate) > 0:
+                            local_apk = candidate
+                            break
+                if local_apk:
+                    break
+            if local_apk:
+                break
+
+        if local_apk:
+            print(f"  {C.GREEN}[+] Found local APK: {local_apk}{C.RST}")
+        else:
+            apk_path = get_apk_path(pkg)
+            if not apk_path:
+                print(f"  {C.RED}[!] Could not locate APK for {pkg}{C.RST}")
+                pause()
+                return
+            local_apk = os.path.join(work_dir, f"{pkg}.apk")
+            print(f"\n  {C.DIM}Pulling APK from device...{C.RST}")
+            adb_pull(apk_path, local_apk)
+            if not os.path.exists(local_apk) or os.path.getsize(local_apk) == 0:
+                print(f"  {C.RED}[!] Failed to pull APK.{C.RST}")
+                pause()
+                return
+
+        # ── Step 3: Decompile ────────────────────────────────────────────
+        decompiled = os.path.join(work_dir, f"{pkg}_patched")
+        if os.path.isdir(decompiled):
+            shutil.rmtree(decompiled, ignore_errors=True)
+
+        print(f"  {C.DIM}Decompiling APK...{C.RST}")
+        try:
+            r = subprocess.run(
+                f'{apktool_cmd} d -f -o "{decompiled}" "{local_apk}"',
+                shell=True, capture_output=True, text=True, timeout=300,
+                encoding='utf-8', errors='replace'
+            )
+            if r.returncode != 0 or not os.path.isdir(decompiled):
+                print(f"  {C.RED}[!] Decompilation failed:{C.RST}")
+                print(f"  {C.DIM}{r.stderr[:400] if r.stderr else 'unknown error'}{C.RST}")
+                pause()
+                return
+        except subprocess.TimeoutExpired:
+            print(f"  {C.RED}[!] Decompilation timed out.{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] Decompiled successfully{C.RST}")
+
+        # ── Step 4: Find main activity ───────────────────────────────────
+        manifest = os.path.join(decompiled, "AndroidManifest.xml")
+        if not os.path.isfile(manifest):
+            print(f"  {C.RED}[!] AndroidManifest.xml not found{C.RST}")
+            pause()
+            return
+
+        main_activity = _find_main_activity(manifest)
+        if not main_activity:
+            print(f"  {C.RED}[!] Could not determine launcher activity{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] Launcher: {main_activity}{C.RST}")
+
+        # ── Step 5: Patch manifest ───────────────────────────────────────
+        _patch_manifest_for_gadget(manifest)
+
+        # ── Step 6: Inject gadget loader into smali ──────────────────────
+        smali_relative = main_activity.replace(".", os.sep) + ".smali"
+        smali_path = None
+        for entry in sorted(os.listdir(decompiled)):
+            if entry.startswith("smali"):
+                candidate = os.path.join(decompiled, entry, smali_relative)
+                if os.path.isfile(candidate):
+                    smali_path = candidate
+                    break
+
+        if not smali_path:
+            print(f"  {C.RED}[!] Smali not found for {main_activity}{C.RST}")
+            pause()
+            return
+
+        print(f"  {C.DIM}Injecting gadget loader...{C.RST}")
+        if not _inject_gadget_loader(smali_path):
+            print(f"  {C.RED}[!] Failed to inject gadget loader{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] Gadget loader injected into smali{C.RST}")
+
+        # ── Step 7: Copy gadget .so ──────────────────────────────────────
+        lib_dir = os.path.join(decompiled, "lib", "arm64-v8a")
+        os.makedirs(lib_dir, exist_ok=True)
+        shutil.copy2(gadget_so, os.path.join(lib_dir, GADGET_SO_NAME))
+        print(f"  {C.GREEN}[+] Copied {GADGET_SO_NAME} → lib/arm64-v8a/{C.RST}")
+
+        # ── Step 8: Rebuild ──────────────────────────────────────────────
+        rebuilt_apk = os.path.join(work_dir, f"{pkg}_rebuilt.apk")
+        print(f"  {C.DIM}Rebuilding APK...{C.RST}")
+        try:
+            r = subprocess.run(
+                f'{apktool_cmd} b -o "{rebuilt_apk}" "{decompiled}"',
+                shell=True, capture_output=True, text=True, timeout=300,
+                encoding='utf-8', errors='replace'
+            )
+            if r.returncode != 0 or not os.path.isfile(rebuilt_apk):
+                print(f"  {C.RED}[!] Rebuild failed:{C.RST}")
+                print(f"  {C.DIM}{r.stderr[:400] if r.stderr else 'unknown error'}{C.RST}")
+                pause()
+                return
+        except subprocess.TimeoutExpired:
+            print(f"  {C.RED}[!] Rebuild timed out.{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] APK rebuilt{C.RST}")
+
+        # ── Step 9: Sign ─────────────────────────────────────────────────
+        keystore = os.path.join(gadget_cache, "debug.keystore")
+        if not os.path.isfile(keystore):
+            print(f"  {C.DIM}Generating debug keystore...{C.RST}")
+            subprocess.run(
+                f'keytool -genkeypair -v -keystore "{keystore}" '
+                f'-alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 '
+                f'-storepass android -keypass android '
+                f'-dname "CN=Android Debug,O=Android,C=US"',
+                shell=True, capture_output=True, text=True, timeout=30
+            )
+
+        signed_apk = os.path.join(work_dir, f"{pkg}_signed.apk")
+        print(f"  {C.DIM}Signing APK with {signer}...{C.RST}")
+
+        if signer == "apksigner":
+            # zipalign first if available
+            zipaligned = os.path.join(work_dir, f"{pkg}_aligned.apk")
+            if shutil.which("zipalign"):
+                subprocess.run(
+                    f'zipalign -f 4 "{rebuilt_apk}" "{zipaligned}"',
+                    shell=True, capture_output=True, text=True, timeout=60
+                )
+                to_sign = zipaligned
+            else:
+                to_sign = rebuilt_apk
+
+            r = subprocess.run(
+                f'apksigner sign --ks "{keystore}" --ks-pass pass:android '
+                f'--ks-key-alias androiddebugkey --key-pass pass:android '
+                f'--out "{signed_apk}" "{to_sign}"',
+                shell=True, capture_output=True, text=True, timeout=60,
+                encoding='utf-8', errors='replace'
+            )
+        else:
+            # jarsigner signs in-place
+            shutil.copy2(rebuilt_apk, signed_apk)
+            r = subprocess.run(
+                f'jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 '
+                f'-keystore "{keystore}" -storepass android -keypass android '
+                f'"{signed_apk}" androiddebugkey',
+                shell=True, capture_output=True, text=True, timeout=60,
+                encoding='utf-8', errors='replace'
+            )
+            # zipalign after jarsigner if available
+            if shutil.which("zipalign"):
+                aligned = os.path.join(work_dir, f"{pkg}_aligned.apk")
+                subprocess.run(
+                    f'zipalign -f 4 "{signed_apk}" "{aligned}"',
+                    shell=True, capture_output=True, text=True, timeout=60
+                )
+                shutil.move(aligned, signed_apk)
+
+        if r.returncode != 0:
+            print(f"  {C.RED}[!] Signing failed:{C.RST}")
+            print(f"  {C.DIM}{r.stderr[:400] if r.stderr else r.stdout[:400]}{C.RST}")
+            pause()
+            return
+        print(f"  {C.GREEN}[+] APK signed{C.RST}")
+
+        # ── Step 10: Move to patched_apks/ ───────────────────────────────
+        final_name = f"{pkg}_gadget_patched.apk"
+        final_path = os.path.join(patched_dir, final_name)
+        shutil.move(signed_apk, final_path)
+
+        print(f"\n  {C.GREEN}{C.BOLD}{'='*50}{C.RST}")
+        print(f"  {C.GREEN}{C.BOLD}[✓] PATCHED APK READY{C.RST}")
+        print(f"  {C.GREEN}{C.BOLD}{'='*50}{C.RST}")
+        print(f"  {C.WHITE}{final_path}{C.RST}")
+        print(f"\n  {C.CYAN}To install:{C.RST}")
+        print(f"  {C.DIM}  adb uninstall {pkg}{C.RST}")
+        print(f'  {C.DIM}  adb install "{final_path}"{C.RST}')
+        print(f"\n  {C.CYAN}Then launch the app — Frida Gadget will listen on port 27042.{C.RST}")
+        print(f"  {C.DIM}  frida {FRIDA_CONN} -n Gadget{C.RST}")
+
+    finally:
+        # Clean up work dir
+        if os.path.isdir(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    pause()
+
+
 # ─── Frida Server Config ─────────────────────────────────────────────────────────
 
 def frida_server_config():
@@ -3287,10 +3721,12 @@ def main_menu(device_info, has_root, selected_pkg):
   ║  {C.YELLOW}[7]{C.CYAN} Logcat Live Monitor                 ║
   ║      {C.DIM}Filter logcat output in real-time{C.RST}{C.CYAN}   ║
   ║  {C.YELLOW}[8]{C.CYAN} Frida CodeShare                     ║
-  ║  {C.YELLOW}[9]{C.CYAN} Frida Server Config                 ║
-  ║  {C.YELLOW}[10]{C.CYAN} MASVS-STORAGE Assessment           ║
+  ║  {C.YELLOW}[9]{C.CYAN} Frida Gadget Patcher                ║
+  ║      {C.DIM}Patch APK with frida-gadget .so{C.RST}{C.CYAN}      ║
+  ║  {C.YELLOW}[10]{C.CYAN} Frida Server Config                ║
+  ║  {C.YELLOW}[11]{C.CYAN} MASVS-STORAGE Assessment           ║
   ║      {C.DIM}OWASP Data Storage L1 (10 checks){C.RST}{C.CYAN}   ║
-  ║  {C.YELLOW}[11]{C.CYAN} Testcases for Fun                  ║
+  ║  {C.YELLOW}[12]{C.CYAN} Testcases for Fun                  ║
   ║      {C.DIM}Exported components, clipboard, URLs{C.RST}{C.CYAN} ║
   ║                                          ║
   ║  {C.YELLOW}[a]{C.CYAN} Switch App                          ║
@@ -3345,7 +3781,7 @@ def main():
         return
 
     # Options that require a selected app
-    APP_REQUIRED = {"1", "2", "5", "7", "8", "10", "11"}
+    APP_REQUIRED = {"1", "2", "5", "7", "8", "9", "11", "12"}
 
     while True:
         main_menu(device, has_root, selected_pkg)
@@ -3384,10 +3820,12 @@ def main():
         elif choice == "8":
             frida_codeshare(selected_pkg)
         elif choice == "9":
-            frida_server_config()
+            frida_gadget_patch(selected_pkg)
         elif choice == "10":
-            masvs_storage(selected_pkg)
+            frida_server_config()
         elif choice == "11":
+            masvs_storage(selected_pkg)
+        elif choice == "12":
             fun_testcases(selected_pkg)
         elif choice == "0":
             print(f"\n  {C.CYAN}Goodbye.{C.RST}\n")

@@ -22,9 +22,10 @@ Interactive terminal menu for app analysis, storage auditing, shell access, scre
 | 6 | **Keyboard Cache Detection** | Check if LokiBoard keyboard caches user input in plaintext. Prompts user to type in the app, then searches all `lokiboard_files_*.txt` cache files for the entered text |
 | 7 | **Logcat Live Monitor** | Stream `adb logcat` in real-time filtered by a search string. Matched text highlighted in bold red. Ctrl+C to stop |
 | 8 | **Frida CodeShare** | Auto-start frida-server (USB default), run local bypass scripts or 38 grouped CodeShare scripts (see below) |
-| 9 | **Frida Server Config** | Switch between USB (`-U`) and custom host:port (`-H ip:port`), restart/kill frida-server, set up ADB port forwarding |
-| 10 | **MASVS-STORAGE Assessment** | OWASP MASVS-STORAGE L1 compliance — 10 test cases across static + dynamic analysis (see below) |
-| 11 | **Testcases for Fun** | Launch exported activities/services/receivers, clipboard spy, dev/staging URL finder (see below) |
+| 9 | **Frida Gadget Patcher** | Patch APK with Frida Gadget for non-root dynamic analysis — auto-downloads gadget, injects loader, re-signs (see below) |
+| 10 | **Frida Server Config** | Switch between USB (`-U`) and custom host:port (`-H ip:port`), restart/kill frida-server, set up ADB port forwarding |
+| 11 | **MASVS-STORAGE Assessment** | OWASP MASVS-STORAGE L1 compliance — 10 test cases across static + dynamic analysis (see below) |
+| 12 | **Testcases for Fun** | Launch exported activities/services/receivers, clipboard spy, dev/staging URL finder (see below) |
 
 ### Auto Frida Server
 
@@ -33,7 +34,7 @@ On startup (with root), the analyzer automatically:
 2. Starts frida-server on default USB port (`-U`)
 3. All Frida commands use USB mode by default
 
-Use menu option **[9] Frida Server Config** to switch to a custom host:port (`-H ip:port`), restart the server on a custom listen address, or kill the server.
+Use menu option **[10] Frida Server Config** to switch to a custom host:port (`-H ip:port`), restart the server on a custom listen address, or kill the server.
 
 ### Framework Detection
 
@@ -97,7 +98,28 @@ Detection scans decompile the APK once and cache the output in `.apkanalyzer_tmp
 python3 apkanalyzer.py
 ```
 
-### MASVS-STORAGE Assessment (Option 10)
+### Frida Gadget Patcher (Option 9)
+
+Patches the selected APK with [Frida Gadget](https://frida.re/docs/gadget/) for dynamic analysis on non-rooted devices.
+
+**Pipeline:**
+
+| Step | Action |
+|------|--------|
+| 1 | **Check dependencies** — `apktool` (or `java -jar apktool.jar`), `jarsigner`/`apksigner`, `keytool` |
+| 2 | **Download Frida Gadget** — `frida-gadget-17.6.2-android-arm64.so.xz` from GitHub releases (cached in `.gadget_cache/`, skips download if already present) |
+| 3 | **Get APK** — uses local copy from `extracted_apks/` or pulls from device |
+| 4 | **Decompile** with apktool |
+| 5 | **Find launcher activity** from `AndroidManifest.xml` |
+| 6 | **Patch manifest** — add `INTERNET` permission, set `extractNativeLibs="true"` |
+| 7 | **Inject smali** — `System.loadLibrary("frida-gadget")` into `<clinit>` or `onCreate` |
+| 8 | **Copy** `libfrida-gadget.so` into `lib/arm64-v8a/` |
+| 9 | **Rebuild** with apktool |
+| 10 | **Sign** with auto-generated debug keystore (+ zipalign if available) |
+
+Output saved to `patched_apks/<pkg>_gadget_patched.apk`.
+
+### MASVS-STORAGE Assessment (Option 11)
 
 Two-phase OWASP MASVS-STORAGE L1 compliance assessment combining static and dynamic analysis.
 
@@ -128,7 +150,7 @@ The tool clears logcat, launches the app, and starts background logcat capture. 
 
 Results are categorized as PASS/FAIL/WARN with a compliance verdict: **COMPLIANT**, **PARTIALLY COMPLIANT**, or **NON-COMPLIANT**.
 
-### Testcases for Fun (Option 11)
+### Testcases for Fun (Option 12)
 
 Interactive sub-menu with 5 test cases for hands-on exploration of app attack surface.
 
@@ -166,5 +188,7 @@ Interactive sub-menu with 5 test cases for hands-on exploration of app attack su
 - Press `[a]` from the main menu to switch target app at any time
 - No external Python dependencies — pure stdlib
 - Extracted APKs saved to `./extracted_apks/`
+- Patched APKs saved to `./patched_apks/`
 - Screenshots saved to `./screenshots/`
+- Frida Gadget cached in `./.gadget_cache/`
 - Decompiled cache saved to `./.apkanalyzer_tmp/`
