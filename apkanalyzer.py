@@ -203,6 +203,7 @@ def banner():
    ║  ╚═╝  ╚═╝╚═════╝ ╚═════╝                               ║
    ║        {C.MAGENTA}A N A L Y Z E R{C.CYAN}                               ║
    ║  {C.DIM}{C.WHITE}Android Security Analysis Tool{C.RST}{C.CYAN}{C.BOLD}                       ║
+   ║  {C.DIM}{C.WHITE}github.com/worldtreeboy/apkAnalyzer{C.RST}{C.CYAN}{C.BOLD}                  ║
    ╚══════════════════════════════════════════════════════════╝{C.RST}
 """
     print(b)
@@ -4016,7 +4017,8 @@ def main():
     apps = list_third_party_apps()
     selected_pkg = pick_app(apps)
     if not selected_pkg:
-        print(f"\n  {C.CYAN}Goodbye.{C.RST}\n")
+        print(f"\n  {C.CYAN}Goodbye.{C.RST}")
+        print(f"  {C.DIM}Like this tool? Star it: {C.WHITE}https://github.com/worldtreeboy/apkAnalyzer{C.RST}\n")
         return
 
     # Options that require a selected app
@@ -4027,7 +4029,8 @@ def main():
         try:
             choice = input(f"  {C.GREEN}Select option ▸ {C.RST}").strip()
         except (EOFError, KeyboardInterrupt):
-            print(f"\n  {C.CYAN}Goodbye.{C.RST}\n")
+            print(f"\n  {C.CYAN}Goodbye.{C.RST}")
+        print(f"  {C.DIM}Like this tool? Star it: {C.WHITE}https://github.com/worldtreeboy/apkAnalyzer{C.RST}\n")
             break
 
         if choice.lower() == "a":
@@ -4065,7 +4068,8 @@ def main():
         elif choice == "11":
             fun_testcases(selected_pkg)
         elif choice == "0":
-            print(f"\n  {C.CYAN}Goodbye.{C.RST}\n")
+            print(f"\n  {C.CYAN}Goodbye.{C.RST}")
+        print(f"  {C.DIM}Like this tool? Star it: {C.WHITE}https://github.com/worldtreeboy/apkAnalyzer{C.RST}\n")
             break
         else:
             print(f"  {C.RED}Invalid option.{C.RST}")
