@@ -1030,6 +1030,49 @@ SECRET_PATTERNS = [
     r'-----BEGIN CERTIFICATE-----',
 ]
 
+# ── PII / Sensitive Data Value Patterns ────────────────────────────────────────
+# Each tuple: (compiled_regex, label) — scans actual content for stored PII
+PII_PATTERNS = [
+    # Credit / Debit Cards
+    (re.compile(r'\b4[0-9]{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b'), 'Credit Card (Visa)'),
+    (re.compile(r'\b5[1-5][0-9]{2}[\s-]?[0-9]{4}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b'), 'Credit Card (Mastercard)'),
+    (re.compile(r'\b3[47][0-9]{2}[\s-]?[0-9]{6}[\s-]?[0-9]{5}\b'), 'Credit Card (AMEX)'),
+    (re.compile(r'\b6(?:011|5[0-9]{2})[\s-]?[0-9]{4}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b'), 'Credit Card (Discover)'),
+    # Singapore NRIC / FIN (S/T/F/G/M + 7 digits + checksum letter)
+    (re.compile(r'\b[STFGM]\d{7}[A-Z]\b'), 'NRIC/FIN (SG)'),
+    # Malaysia IC (YYMMDD-PP-####)
+    (re.compile(r'\b\d{6}-\d{2}-\d{4}\b'), 'IC Number (MY)'),
+    # US SSN (###-##-####)
+    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), 'SSN (US)'),
+    # Passport number near keyword
+    (re.compile(r'(?i)passport[\s_:="]*[A-Z][A-Z0-9]\d{6,8}\b'), 'Passport Number'),
+    # Email addresses
+    (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), 'Email Address'),
+    # Phone with international country code
+    (re.compile(r'\+\d{1,3}[\s-]?\d{4,}[\s-]?\d{3,}'), 'Phone Number'),
+    # IBAN
+    (re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b'), 'IBAN'),
+    # Account number preceded by keyword
+    (re.compile(r'(?i)(?:account|acct)[_\s.-]*(?:no|num|number|#)?[_\s:="]*\d{8,17}\b'), 'Account Number'),
+    # Date of birth near keyword
+    (re.compile(r'(?i)(?:dob|date.of.birth|birth.?date)[_\s:="]*\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}'), 'Date of Birth'),
+    # Full name near keyword
+    (re.compile(r'(?i)(?:full.?name|customer.?name|card.?holder|account.?holder)[_\s:="]*[A-Z][a-z]+\s+[A-Z][a-z]+'), 'Full Name'),
+]
+
+def _scan_pii(content):
+    """Scan content for PII patterns. Returns list of (label, matched_value)."""
+    hits = []
+    seen = set()
+    for pattern, label in PII_PATTERNS:
+        for m in pattern.finditer(content):
+            val = m.group().strip()[:80]
+            key = (label, val)
+            if key not in seen:
+                seen.add(key)
+                hits.append((label, val))
+    return hits
+
 def storage_audit(pkg):
     section("STORAGE AUDIT")
 
@@ -1068,6 +1111,7 @@ def storage_audit(pkg):
     if sp_files:
         print(f"\n  {C.YELLOW}{C.BOLD}── SharedPreferences ──{C.RST}")
         secrets_found = 0
+        pii_found = 0
         encrypted_prefs = 0
 
         # Sort: app-specific files first, SDK files last
@@ -1129,8 +1173,8 @@ def storage_audit(pkg):
                         # PII
                         'email', 'mail', 'phone', 'mobile', 'number', 'address',
                         'name', 'fullname', 'first_name', 'last_name', 'dob',
-                        'birth', 'ssn', 'social', 'national_id', 'passport',
-                        'license', 'gender', 'age',
+                        'birth', 'ssn', 'social', 'national_id', 'nric', 'passport',
+                        'license', 'gender', 'age', 'ic_number', 'identity',
                         # Financial
                         'account', 'balance', 'credit', 'debit', 'card',
                         'iban', 'routing', 'swift', 'payment', 'bank',
@@ -1160,10 +1204,22 @@ def storage_audit(pkg):
                             val = match if isinstance(match, str) else match[0]
                             print(f"      {C.RED}⚠ Potential secret: {val[:60]}...{C.RST}")
 
+                # Check for PII in values
+                pii_hits = _scan_pii(content)
+                if pii_hits:
+                    pii_found += 1
+                    print(f"      {C.RED}PII Detected ({len(pii_hits)}):{C.RST}")
+                    for label, val in pii_hits[:8]:
+                        print(f"        {C.RED}⚠ {label}: {val}{C.RST}")
+
         if encrypted_prefs > 0:
             print(f"\n    {C.GREEN}Found {encrypted_prefs} EncryptedSharedPreferences file(s).{C.RST}")
-        if secrets_found == 0:
+        if secrets_found == 0 and pii_found == 0:
+            print(f"\n    {C.GREEN}No plaintext secrets or PII detected in SharedPreferences.{C.RST}")
+        elif secrets_found == 0:
             print(f"\n    {C.GREEN}No plaintext secrets detected in SharedPreferences.{C.RST}")
+        if pii_found > 0:
+            print(f"\n    {C.RED}⚠ PII found in {pii_found} SharedPreferences file(s)!{C.RST}")
 
     # SQLite Database analysis
     # SDK database names to de-prioritize
@@ -1227,15 +1283,26 @@ def storage_audit(pkg):
                             if len(col_names) > 8:
                                 print(f"        {C.DIM}... and {len(col_names) - 8} more columns{C.RST}")
 
-                        # Show sample data (first 3 rows) for sensitive-looking tables
-                        sensitive_tables = ['user', 'account', 'credential', 'token', 'session', 'auth', 'login', 'profile', 'setting', 'config', 'cache']
-                        if any(st in table.lower() for st in sensitive_tables) and count != "?" and int(count) > 0:
-                            sample = adb_su(f"sqlite3 {dbf} 'SELECT * FROM {table} LIMIT 3' 2>/dev/null", timeout=5)
+                        # Fetch sample data for PII scanning + display
+                        sensitive_tables = ['user', 'account', 'credential', 'token', 'session',
+                                            'auth', 'login', 'profile', 'setting', 'config',
+                                            'cache', 'payment', 'card', 'address', 'contact',
+                                            'transaction', 'order', 'customer', 'member']
+                        if count != "?" and int(count) > 0:
+                            sample = adb_su(f"sqlite3 {dbf} 'SELECT * FROM {table} LIMIT 5' 2>/dev/null", timeout=5)
                             if sample and not sample.startswith("["):
-                                print(f"        {C.RED}Sample data:{C.RST}")
-                                for row in sample.splitlines()[:3]:
-                                    row_display = row[:100] + "..." if len(row) > 100 else row
-                                    print(f"          {C.DIM}{row_display}{C.RST}")
+                                # Show raw rows for sensitive-looking tables
+                                if any(st in table.lower() for st in sensitive_tables):
+                                    print(f"        {C.RED}Sample data:{C.RST}")
+                                    for row in sample.splitlines()[:3]:
+                                        row_display = row[:100] + "..." if len(row) > 100 else row
+                                        print(f"          {C.DIM}{row_display}{C.RST}")
+                                # Scan ALL app tables for PII
+                                pii_hits = _scan_pii(sample)
+                                if pii_hits:
+                                    print(f"        {C.RED}⚠ PII in data ({len(pii_hits)}):{C.RST}")
+                                    for label, val in pii_hits[:5]:
+                                        print(f"          {C.RED}⚠ {label}: {val}{C.RST}")
 
                     if len(table_list) > 5:
                         print(f"      {C.DIM}... and {len(table_list) - 5} more tables{C.RST}")
@@ -1272,10 +1339,12 @@ def storage_audit(pkg):
             'email', 'mail', 'phone', 'mobile', 'account', 'balance', 'credit',
             'card', 'iban', 'payment', 'bank', 'amount', 'transaction', 'wallet',
             'private', 'cert', 'api', 'bearer', 'refresh', 'access',
-            'imei', 'imsi', 'device_id', 'ssn', 'address', 'name', 'dob',
+            'imei', 'imsi', 'device_id', 'ssn', 'nric', 'passport',
+            'address', 'name', 'dob',
             'fingerprint', 'biometric', 'number',
         ]
         other_secrets = 0
+        other_pii = 0
 
         for of in other_files:
             fname = os.path.basename(of)
@@ -1331,10 +1400,21 @@ def storage_audit(pkg):
             for sh in secret_hits:
                 print(f"      {C.RED}⚠ Potential secret: {sh}{C.RST}")
 
-        if other_secrets == 0:
-            print(f"\n    {C.GREEN}No secrets detected in other files.{C.RST}")
+            # Check for PII in content
+            pii_hits = _scan_pii(content)
+            if pii_hits:
+                other_pii += 1
+                print(f"      {C.RED}PII Detected ({len(pii_hits)}):{C.RST}")
+                for label, val in pii_hits[:5]:
+                    print(f"        {C.RED}⚠ {label}: {val}{C.RST}")
+
+        if other_secrets == 0 and other_pii == 0:
+            print(f"\n    {C.GREEN}No secrets or PII detected in other files.{C.RST}")
         else:
-            print(f"\n    {C.RED}⚠ Found potential secrets in {other_secrets} file(s).{C.RST}")
+            if other_secrets > 0:
+                print(f"\n    {C.RED}⚠ Found potential secrets in {other_secrets} file(s).{C.RST}")
+            if other_pii > 0:
+                print(f"\n    {C.RED}⚠ Found PII in {other_pii} file(s)!{C.RST}")
 
     # File Permission Check (world-readable)
     print(f"\n  {C.YELLOW}{C.BOLD}── File Permissions ──{C.RST}")
@@ -1401,10 +1481,10 @@ def shell_access(pkg=None):
                 new_cwd = os.path.normpath(target)
             else:
                 new_cwd = os.path.normpath(f"{cwd}/{target}")
-            # Verify directory exists on device (simple command, no &&)
-            check = adb_su(f'ls -d {new_cwd}')
-            if check and check.strip() == new_cwd:
-                cwd = new_cwd
+            # Verify directory exists by actually cd-ing into it
+            check = _shell_su(f'cd {new_cwd} && pwd')
+            if check and not check.startswith('[') and '/' in check:
+                cwd = check.strip().splitlines()[-1].strip()
             else:
                 print(f"  {C.RED}cd: {target}: No such directory{C.RST}\n")
             continue
