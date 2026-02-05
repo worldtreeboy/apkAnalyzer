@@ -1860,6 +1860,236 @@ def security_scan(pkg):
     else:
         info_line("Broadcast security", "No sendBroadcast() usage detected")
 
+    # ── Screenshot Protection (FLAG_SECURE) ─────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Screenshot Protection ──{C.RST}")
+    flag_secure_found = False
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            if fname.endswith('.smali'):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='ignore') as fh:
+                        content = fh.read()
+                    if 'FLAG_SECURE' in content or 'setFlags(8192' in content:
+                        flag_secure_found = True
+                        break
+                except Exception:
+                    continue
+        if flag_secure_found:
+            break
+    if flag_secure_found:
+        pass_fail("FLAG_SECURE", True, "Screenshot protection detected")
+        passes += 1
+    else:
+        warn_line("FLAG_SECURE not detected — screenshots may expose sensitive data")
+        warns += 1
+
+    # ── Clipboard Data Exposure ─────────────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Clipboard Data Exposure ──{C.RST}")
+    clip_usage = 0
+    clip_protection = 0
+    clip_files = []
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            if fname.endswith('.smali'):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='ignore') as fh:
+                        content = fh.read()
+                    has_clip = any(kw in content for kw in
+                                  ('ClipboardManager', 'ClipData', 'setPrimaryClip', 'getPrimaryClip'))
+                    if has_clip:
+                        clip_usage += 1
+                        rel = os.path.relpath(fpath, decompiled_dir)
+                        clip_files.append(rel)
+                    if 'FLAG_SENSITIVE' in content or 'isSensitive' in content:
+                        clip_protection += 1
+                except Exception:
+                    continue
+    if clip_usage > 0 and clip_protection == 0:
+        warn_line(f"Clipboard used without FLAG_SENSITIVE protection ({clip_usage} file(s))")
+        warns += 1
+        for cf in clip_files[:3]:
+            print(f"    {C.DIM}{cf}{C.RST}")
+    elif clip_usage > 0 and clip_protection > 0:
+        pass_fail("Clipboard", True, "Clipboard used with sensitive flag protection")
+        passes += 1
+    else:
+        pass_fail("Clipboard", True, "No direct clipboard operations detected")
+        passes += 1
+
+    # ── Debug / Verbose Logging ────────────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Debug / Verbose Logging ──{C.RST}")
+    log_keywords = {
+        "Java":   ['Landroid/util/Log;->v(', 'Landroid/util/Log;->d('],
+        "Kotlin": ['Timber;->d(', 'Timber;->v('],
+        "Flutter": ['debugPrint', 'kDebugMode'],
+        "React Native": ['console.log', 'console.debug'],
+    }
+    log_hits = {}
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            if fname.endswith('.smali'):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='ignore') as fh:
+                        content = fh.read()
+                    for framework, kws in log_keywords.items():
+                        for kw in kws:
+                            if kw in content:
+                                log_hits[framework] = log_hits.get(framework, 0) + 1
+                except Exception:
+                    continue
+    if log_hits:
+        total = sum(log_hits.values())
+        warn_line(f"Debug/verbose log calls found ({total} file(s))")
+        warns += 1
+        for fw, count in log_hits.items():
+            print(f"    {C.DIM}• {fw}: {count} file(s){C.RST}")
+    else:
+        pass_fail("Debug logging", True, "No verbose/debug log calls detected")
+        passes += 1
+
+    # ── Keyboard Cache / Input Types ────────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Keyboard Cache ──{C.RST}")
+    pw_fields = 0
+    nosuggest = 0
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            if fname.endswith('.xml'):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='ignore') as fh:
+                        content = fh.read()
+                    for kw in ('textPassword', 'textVisiblePassword', 'numberPassword', 'textWebPassword'):
+                        if kw in content:
+                            pw_fields += content.count(kw)
+                    for kw in ('textNoSuggestions', 'flagNoPersonalizedLearning'):
+                        if kw in content:
+                            nosuggest += content.count(kw)
+                except Exception:
+                    continue
+    if pw_fields:
+        pass_fail("Secure input types", True, f"{pw_fields} password-type field(s) found")
+        passes += 1
+    else:
+        warn_line("No password inputType fields found in layouts")
+        warns += 1
+    if nosuggest:
+        info_line("textNoSuggestions", f"{nosuggest} field(s) disable keyboard learning")
+    else:
+        warn_line("No textNoSuggestions flag — keyboard may cache sensitive input")
+        warns += 1
+
+    # ── Task Hijacking (taskAffinity) ───────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Task Hijacking ──{C.RST}")
+    task_hijack = []
+    for m in re.finditer(
+        r'<activity\s([^>]*?)(?:/>|>)', manifest, re.IGNORECASE | re.DOTALL
+    ):
+        attrs = m.group(1)
+        name_m = re.search(r'android:name\s*=\s*"([^"]+)"', attrs)
+        if not name_m:
+            continue
+        affinity_m = re.search(r'android:taskAffinity\s*=\s*"([^"]*)"', attrs)
+        if affinity_m:
+            aff = affinity_m.group(1)
+            # Empty string taskAffinity is actually a mitigation
+            if aff:
+                task_hijack.append((name_m.group(1), aff))
+    if task_hijack:
+        warn_line(f"Activities with custom taskAffinity ({len(task_hijack)}) — StrandHogg risk")
+        warns += 1
+        for act_name, aff in task_hijack[:5]:
+            print(f"    {C.DIM}• {act_name}{C.RST}")
+            print(f"      {C.DIM}taskAffinity=\"{aff}\"{C.RST}")
+    else:
+        pass_fail("Task hijacking", True, "No custom taskAffinity found")
+        passes += 1
+
+    # ── Tapjacking Protection ───────────────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Tapjacking Protection ──{C.RST}")
+    has_filter_touches = False
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            if fname.endswith(('.xml', '.smali')):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='ignore') as fh:
+                        content = fh.read()
+                    if 'filterTouchesWhenObscured' in content:
+                        has_filter_touches = True
+                        break
+                except Exception:
+                    continue
+        if has_filter_touches:
+            break
+    if has_filter_touches:
+        pass_fail("Tapjacking", True, "filterTouchesWhenObscured detected")
+        passes += 1
+    else:
+        warn_line("No filterTouchesWhenObscured — app may be vulnerable to tapjacking")
+        warns += 1
+
+    # ── APK Signing Scheme ──────────────────────────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── APK Signing Scheme ──{C.RST}")
+    # Locate the APK file
+    apk_file = None
+    for search_dir in [os.path.join(os.getcwd(), "extracted_apks"),
+                       os.path.join(os.getcwd(), "patched_apks"),
+                       work_dir, os.getcwd()]:
+        if not os.path.isdir(search_dir):
+            continue
+        for fname in os.listdir(search_dir):
+            if fname.endswith(".apk") and pkg in fname:
+                candidate = os.path.join(search_dir, fname)
+                if os.path.getsize(candidate) > 0:
+                    apk_file = candidate
+                    break
+        if apk_file:
+            break
+
+    if apk_file and shutil.which("apksigner"):
+        try:
+            r = subprocess.run(
+                f'apksigner verify --print-certs -v "{apk_file}"',
+                shell=True, capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace'
+            )
+            output = r.stdout + r.stderr
+            has_v1 = bool(re.search(r'Verified using v1 scheme.*?:\s*true', output, re.IGNORECASE))
+            has_v2 = bool(re.search(r'Verified using v2 scheme.*?:\s*true', output, re.IGNORECASE))
+            has_v3 = bool(re.search(r'Verified using v3 scheme.*?:\s*true', output, re.IGNORECASE))
+            has_v4 = bool(re.search(r'Verified using v4 scheme.*?:\s*true', output, re.IGNORECASE))
+
+            schemes = []
+            if has_v1: schemes.append("v1 (JAR)")
+            if has_v2: schemes.append("v2 (APK Sig)")
+            if has_v3: schemes.append("v3 (Key Rotation)")
+            if has_v4: schemes.append("v4 (Incremental)")
+
+            if schemes:
+                info_line("Signing schemes", ", ".join(schemes))
+            if has_v1 and not has_v2 and not has_v3:
+                pass_fail("APK signing", False, "v1-only signing — vulnerable to Janus (CVE-2017-13156)")
+                fails += 1
+            elif has_v2 or has_v3:
+                pass_fail("APK signing", True, "Uses v2/v3 signing scheme")
+                passes += 1
+            else:
+                info_line("APK signing", "Could not determine signing schemes")
+
+            # Extract signer info
+            for cn_m in re.finditer(r'CN=([^,\n]+)', output):
+                info_line("Signer", cn_m.group(1).strip())
+                break
+        except Exception:
+            info_line("APK signing", "apksigner check failed")
+    elif not shutil.which("apksigner"):
+        info_line("APK signing", "apksigner not found — skipping (install Android SDK build-tools)")
+    else:
+        info_line("APK signing", "APK file not found locally — skipping")
+
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n  {C.CYAN}{'═'*50}{C.RST}")
     print(f"  {C.BOLD}SCAN SUMMARY{C.RST}")
@@ -2708,503 +2938,60 @@ def anti_tamper_check(pkg):
 
     pause()
 
-# ─── MASVS-STORAGE Assessment ─────────────────────────────────────────────────
-
-MASVS_STORAGE_KEYWORDS = [
-    # STORAGE-2: Logging practices
-    ("Verbose/Debug Logging (Java)", [
-        "Landroid/util/Log;->v(", "Landroid/util/Log;->d(",
-        "Log;->v(", "Log;->d(",
-    ]),
-    ("Verbose/Debug Logging (Native C/C++)", [
-        "__android_log_print", "__android_log_write",
-        "ALOG", "ALOGI", "ALOGD", "ALOGV",
-        "LOG_TAG",
-    ]),
-    ("Verbose/Debug Logging (Flutter/Dart)", [
-        "debugPrint", "print(", "log(",
-        "Logger", "developer.log",
-        "kDebugMode",
-    ]),
-    ("Verbose/Debug Logging (React Native/JS)", [
-        "console.log", "console.debug", "console.warn",
-        "console.info", "console.trace",
-    ]),
-    ("Verbose/Debug Logging (Kotlin)", [
-        "Timber;->d(", "Timber;->v(",
-        "timber", "Timber.d(", "Timber.v(",
-        "Log.d(", "Log.v(",
-    ]),
-    # STORAGE-3: Third-party data sharing
-    ("Analytics SDKs", [
-        "com/google/firebase/analytics", "FirebaseAnalytics",
-        "com/google/android/gms/analytics", "com/facebook/appevents",
-        "com/mixpanel", "com/amplitude", "com/segment",
-        "com/flurry", "com/appsflyer",
-    ]),
-    ("Crash Reporting SDKs", [
-        "com/google/firebase/crashlytics", "Crashlytics",
-        "com/bugsnag", "io/sentry", "com/instabug",
-    ]),
-    ("Ad Network SDKs", [
-        "com/google/android/gms/ads", "com/facebook/ads",
-        "com/unity3d/ads", "com/applovin",
-        "com/mopub", "com/chartboost",
-    ]),
-    # STORAGE-5: Keyboard cache / input types
-    ("Password InputType", [
-        "textPassword", "textVisiblePassword", "numberPassword",
-        "textWebPassword",
-    ]),
-    ("No-Suggestion InputType", [
-        "textNoSuggestions", "flagNoPersonalizedLearning",
-    ]),
-    # STORAGE-6: Clipboard
-    ("Clipboard Usage", [
-        "ClipboardManager", "ClipData", "setPrimaryClip",
-        "getPrimaryClip",
-    ]),
-    ("Clipboard Protection", [
-        "FLAG_SENSITIVE", "isSensitive",
-        "PendingIntent;->FLAG_IMMUTABLE",
-    ]),
-    # STORAGE-7: WebView
-    ("WebView Usage", [
-        "Landroid/webkit/WebView", "WebView;->loadUrl",
-        "WebView;->loadData", "loadDataWithBaseURL",
-    ]),
-    ("WebView Storage Settings", [
-        "setDomStorageEnabled", "setDatabaseEnabled",
-        "setAppCacheEnabled",
-    ]),
-    ("WebView Cache Clearing", [
-        "clearCache", "clearFormData", "clearHistory",
-        "deleteAllData",
-    ]),
-    # STORAGE-8: Screenshot protection
-    ("FLAG_SECURE Usage", [
-        "FLAG_SECURE", "LayoutParams.FLAG_SECURE",
-        "setFlags(8192",
-    ]),
-    # STORAGE-9: External storage
-    ("External Storage Write", [
-        "getExternalFilesDir", "getExternalStorageDirectory",
-        "getExternalCacheDir",
-        "Environment;->getExternalStorageDirectory",
-    ]),
-    ("Scoped Storage APIs", [
-        "MediaStore", "ACTION_OPEN_DOCUMENT",
-        "ACTION_CREATE_DOCUMENT", "DocumentsProvider",
-    ]),
-    # STORAGE-10: Notifications
-    ("Notification Builders", [
-        "NotificationCompat$Builder", "Notification$Builder",
-        "setContentText", "setContentTitle",
-    ]),
-    ("Notification Visibility", [
-        "VISIBILITY_SECRET", "VISIBILITY_PRIVATE",
-        "setVisibility",
-    ]),
-]
-
-def masvs_storage(pkg):
-    section("MASVS-STORAGE ASSESSMENT")
-
-    print(f"\n  {C.CYAN}OWASP MASVS-STORAGE (L1): {C.BOLD}{pkg}{C.RST}\n")
-
-    passes = 0
-    fails = 0
-    warns = 0
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  PHASE 1 — Static Analysis (decompile + keyword scan)
-    # ══════════════════════════════════════════════════════════════════════
-    print(f"  {C.CYAN}{C.BOLD}[Phase 1] Static Analysis{C.RST}")
-
-    work_dir, decompiled_dir = _pull_and_decompile(pkg)
-    if not decompiled_dir:
-        pause()
-        return
-
-    manifest_path = os.path.join(decompiled_dir, "AndroidManifest.xml")
-    manifest = ""
-    try:
-        with open(manifest_path, 'r', errors='ignore') as f:
-            manifest = f.read()
-    except Exception:
-        print(f"  {C.RED}[!] Could not read AndroidManifest.xml{C.RST}")
-
-    print(f"  {C.DIM}Running single-pass keyword scan...{C.RST}")
-    results, file_count = _search_decompiled(decompiled_dir, MASVS_STORAGE_KEYWORDS)
-    info_line("Scanned files", f"{file_count} files")
-
-    # ── STORAGE-2 (static): Logging in code ──────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-2: Logging Practices (static) ──{C.RST}")
-
-    log_groups = [
-        "Verbose/Debug Logging (Java)",
-        "Verbose/Debug Logging (Native C/C++)",
-        "Verbose/Debug Logging (Flutter/Dart)",
-        "Verbose/Debug Logging (React Native/JS)",
-        "Verbose/Debug Logging (Kotlin)",
-    ]
-    total_log_hits = 0
-    for lg in log_groups:
-        hits = results.get(lg, [])
-        if hits:
-            total_log_hits += len(hits)
-            framework = lg.split("(")[-1].rstrip(")")
-            print(f"    {C.YELLOW}[!]{C.RST} {framework}: {len(hits)} log calls found")
-            for rel_path, line_no, line_text, kw in hits[:2]:
-                print(f"      {C.DIM}{rel_path}:{line_no} — {kw}{C.RST}")
-
-    if total_log_hits > 0:
-        warn_line(f"Verbose/Debug log calls found", f"{total_log_hits} total across all frameworks")
-        warns += 1
-    else:
-        pass_fail("No verbose/debug logging in code", True)
-        passes += 1
-
-    # ── STORAGE-3: Third-party data sharing ──────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-3: Third-Party Data Sharing ──{C.RST}")
-
-    found_sdks = []
-    for group in ("Analytics SDKs", "Crash Reporting SDKs", "Ad Network SDKs"):
-        hits = results.get(group, [])
-        if hits:
-            found_sdks.append((group, len(hits)))
-
-    if found_sdks:
-        warn_line("Third-party SDKs detected that may receive user data")
-        warns += 1
-        for sdk_name, count in found_sdks:
-            print(f"    {C.DIM}• {sdk_name} ({count} refs){C.RST}")
-    else:
-        pass_fail("No common analytics/ad SDKs detected", True)
-        passes += 1
-
-    # ── STORAGE-4: Backup configuration ──────────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-4: Backup Configuration ──{C.RST}")
-
-    backup_match = re.search(r'android:allowBackup\s*=\s*"(true|false)"', manifest, re.IGNORECASE)
-    allow_backup = not backup_match or backup_match.group(1).lower() == "true"
-
-    fbc = re.search(r'android:fullBackupContent\s*=\s*"([^"]+)"', manifest)
-    der = re.search(r'android:dataExtractionRules\s*=\s*"([^"]+)"', manifest)
-    ba = re.search(r'android:backupAgent\s*=\s*"([^"]+)"', manifest)
-
-    if allow_backup:
-        if fbc or der:
-            warn_line("Backup enabled with rules", "Review backup content rules for sensitive data")
-            warns += 1
-        else:
-            pass_fail("allowBackup", False, "Backup enabled — data extractable via adb backup")
-            fails += 1
-    else:
-        pass_fail("allowBackup disabled", True)
-        passes += 1
-
-    if fbc:
-        info_line("fullBackupContent", fbc.group(1))
-    if der:
-        info_line("dataExtractionRules", der.group(1))
-    if ba:
-        info_line("Custom BackupAgent", ba.group(1))
-
-    # ── STORAGE-5: Keyboard cache / input types ──────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-5: Keyboard Cache ──{C.RST}")
-
-    pw_fields = results.get("Password InputType", [])
-    nosuggest = results.get("No-Suggestion InputType", [])
-
-    if pw_fields:
-        pass_fail("Secure input types used", True, f"{len(pw_fields)} password-type field(s)")
-        passes += 1
-    else:
-        warn_line("No password inputType fields found in layouts")
-        warns += 1
-
-    if nosuggest:
-        info_line("textNoSuggestions used", f"{len(nosuggest)} field(s)")
-    else:
-        warn_line("No textNoSuggestions flag found — keyboard may cache input")
-        warns += 1
-
-    # ── STORAGE-6: Clipboard data exposure ───────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-6: Clipboard Data Exposure ──{C.RST}")
-
-    clip_usage = results.get("Clipboard Usage", [])
-    clip_prot = results.get("Clipboard Protection", [])
-
-    if clip_usage and not clip_prot:
-        warn_line("Clipboard used without sensitive flag", f"{len(clip_usage)} refs")
-        warns += 1
-        for rel_path, line_no, line_text, kw in clip_usage[:3]:
-            print(f"    {C.DIM}{rel_path}:{line_no} — {kw}{C.RST}")
-    elif clip_usage and clip_prot:
-        pass_fail("Clipboard used with protection flags", True)
-        passes += 1
-    else:
-        pass_fail("No direct clipboard operations detected", True)
-        passes += 1
-
-    # ── STORAGE-7 (static): WebView settings ─────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-7: WebView Data Storage (static) ──{C.RST}")
-
-    wv_usage = results.get("WebView Usage", [])
-    wv_storage = results.get("WebView Storage Settings", [])
-    wv_clear = results.get("WebView Cache Clearing", [])
-
-    if wv_usage:
-        if wv_storage and not wv_clear:
-            warn_line("WebView storage enabled without cache clearing", f"{len(wv_storage)} storage refs")
-            warns += 1
-        elif wv_storage and wv_clear:
-            pass_fail("WebView storage with cache clearing", True)
-            passes += 1
-        else:
-            info_line("WebView detected", f"{len(wv_usage)} refs (no explicit storage settings)")
-    else:
-        pass_fail("No WebView usage detected", True)
-        passes += 1
-
-    # ── STORAGE-8: Screenshot protection ─────────────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-8: Screenshot Protection (FLAG_SECURE) ──{C.RST}")
-
-    flag_secure = results.get("FLAG_SECURE Usage", [])
-
-    if flag_secure:
-        pass_fail("FLAG_SECURE usage detected", True, f"{len(flag_secure)} refs")
-        passes += 1
-    else:
-        warn_line("FLAG_SECURE not detected — screenshots may expose sensitive data")
-        warns += 1
-
-    # ── STORAGE-9 (static): External storage API usage ───────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-9: External Storage Usage (static) ──{C.RST}")
-
-    ext_write = results.get("External Storage Write", [])
-    scoped = results.get("Scoped Storage APIs", [])
-
-    if ext_write:
-        warn_line("External storage write operations found", f"{len(ext_write)} refs")
-        warns += 1
-    else:
-        pass_fail("No direct external storage writes detected", True)
-        passes += 1
-
-    if scoped:
-        pass_fail("Uses modern scoped storage APIs", True, f"{len(scoped)} refs")
-        passes += 1
-
-    # ── STORAGE-10: Notification data exposure ───────────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-10: Notification Data Exposure ──{C.RST}")
-
-    notif_usage = results.get("Notification Builders", [])
-    notif_vis = results.get("Notification Visibility", [])
-
-    if notif_usage and not notif_vis:
-        warn_line("Notifications without visibility control", f"{len(notif_usage)} builder refs")
-        warns += 1
-    elif notif_usage and notif_vis:
-        pass_fail("Notification visibility configured", True)
-        passes += 1
-    else:
-        pass_fail("No notification builders detected", True)
-        passes += 1
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  PHASE 2 — Dynamic Analysis (launch app + live monitoring)
-    # ══════════════════════════════════════════════════════════════════════
-    print(f"\n  {C.CYAN}{C.BOLD}[Phase 2] Dynamic Analysis{C.RST}")
-    print(f"  {C.DIM}Clearing logcat and launching app...{C.RST}")
-
-    data_dir = f"/data/data/{pkg}"
-
-    # Clear logcat so we only capture fresh output
-    adb_shell("logcat -c 2>/dev/null")
-    time.sleep(0.5)
-
-    # Launch the app
-    adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null")
-    time.sleep(1)
-
-    # Start background logcat capture to temp file
-    logcat_tmp = os.path.join(os.getcwd(), ".apkanalyzer_tmp", f"{pkg}_logcat.txt")
-    os.makedirs(os.path.dirname(logcat_tmp), exist_ok=True)
-    logcat_fh = open(logcat_tmp, 'w')
-    logcat_proc = subprocess.Popen(
-        "adb shell logcat", shell=True,
-        stdout=logcat_fh, stderr=subprocess.DEVNULL, text=True
-    )
-
-    print(f"\n  {C.GREEN}{C.BOLD}App launched — logcat monitoring active.{C.RST}")
-    print(f"  {C.WHITE}Interact with the app now:{C.RST}")
-    print(f"    {C.DIM}• Log in, enter credentials, browse screens{C.RST}")
-    print(f"    {C.DIM}• Copy/paste sensitive data{C.RST}")
-    print(f"    {C.DIM}• Trigger notifications if possible{C.RST}")
-    print(f"    {C.DIM}• Use all main features of the app{C.RST}")
-
-    try:
-        input(f"\n  {C.YELLOW}{C.BOLD}Press Enter when done interacting ▸ {C.RST}")
-    except (EOFError, KeyboardInterrupt):
-        pass
-
-    # Stop logcat capture
-    logcat_proc.terminate()
-    logcat_fh.close()
-    try:
-        logcat_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        logcat_proc.kill()
-        logcat_proc.wait()
-
-    # Read captured logcat
-    logcat_output = ""
-    try:
-        with open(logcat_tmp, 'r', errors='ignore') as f:
-            logcat_output = f.read()
-    except Exception:
-        pass
-    logcat_lines = logcat_output.splitlines()
-    info_line("Logcat lines captured", str(len(logcat_lines)))
-
-    # ── STORAGE-1: Sensitive data in local storage (post-interaction) ────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-1: Sensitive Data in Local Storage ──{C.RST}")
-    print(f"  {C.DIM}Checking storage after app interaction...{C.RST}")
-
-    sp_secrets = 0
-    sp_files_out = adb_su(f"find {data_dir}/shared_prefs -maxdepth 2 -type f -name '*.xml' 2>/dev/null", timeout=15)
-    sp_files = [f.strip() for f in sp_files_out.splitlines()
-                if f.strip() and f.startswith("/")]
-
-    for spf in sp_files:
-        content = adb_su(f"cat {spf} 2>/dev/null", timeout=15)
-        if content and not content.startswith("["):
-            for pattern in SECRET_PATTERNS:
-                if re.search(pattern, content):
-                    sp_secrets += 1
-                    fname = os.path.basename(spf)
-                    print(f"    {C.RED}[!] Secret in SharedPrefs: {fname}{C.RST}")
-                    break
-
-    db_secrets = 0
-    db_files_out = adb_su(
-        f"find {data_dir} -maxdepth 5 -type f "
-        f"\\( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \\) "
-        f"-not -type l 2>/dev/null", timeout=15)
-    db_files = [f.strip() for f in db_files_out.splitlines()
-                if f.strip() and f.startswith("/")]
-
-    for dbf in db_files:
-        tables = adb_su(f"sqlite3 {dbf} '.tables' 2>/dev/null", timeout=10)
-        if tables and not tables.startswith("[") and "not found" not in tables:
-            for table in tables.split():
-                rows = adb_su(f"sqlite3 {dbf} 'SELECT * FROM {table} LIMIT 5;' 2>/dev/null", timeout=10)
-                if rows:
-                    for pattern in SECRET_PATTERNS:
-                        if re.search(pattern, rows):
-                            db_secrets += 1
-                            print(f"    {C.RED}[!] Potential secret in DB: {os.path.basename(dbf)} -> {table}{C.RST}")
-                            break
-
-    if sp_secrets == 0 and db_secrets == 0:
-        pass_fail("No plaintext secrets in local storage", True)
-        passes += 1
-    else:
-        pass_fail("Plaintext secrets in local storage", False,
-                   f"{sp_secrets} SharedPrefs, {db_secrets} DB tables")
-        fails += 1
-
-    # ── STORAGE-2 (dynamic): Sensitive data in logcat ────────────────────
-    print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-2: Logging Practices (dynamic) ──{C.RST}")
-
-    pkg_lines = [l for l in logcat_lines if pkg in l]
-    info_line("Logcat lines for app", str(len(pkg_lines)))
-
-    log_secrets = 0
-    secret_examples = []
-    combined = "\n".join(pkg_lines)
-    for pattern in SECRET_PATTERNS:
-        matches = re.findall(pattern, combined)
-        if matches:
-            log_secrets += len(matches)
-            for m in matches[:2]:
-                val = m if isinstance(m, str) else m[0]
-                secret_examples.append(val[:80])
-
-    if log_secrets > 0:
-        pass_fail("Sensitive data leaked in logcat", False, f"{log_secrets} potential secrets")
-        fails += 1
-        for ex in secret_examples[:3]:
-            print(f"    {C.RED}[!] {ex}{C.RST}")
-    else:
-        pass_fail("No sensitive data in logcat", True, f"checked {len(pkg_lines)} app log lines")
-        passes += 1
-
-    # ── STORAGE-7 (dynamic): WebView cache on device ─────────────────────
-    wv_cache_dir = f"{data_dir}/app_webview"
-    wv_cache_out = adb_su(f"du -sh {wv_cache_dir} 2>/dev/null")
-    if wv_cache_out and "No such" not in wv_cache_out and not wv_cache_out.startswith("["):
-        size = wv_cache_out.split()[0] if wv_cache_out.split() else "?"
-        print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-7: WebView Cache (dynamic) ──{C.RST}")
-        info_line("WebView cache on device", size)
-
-    # ── STORAGE-9 (dynamic): External storage on device ──────────────────
-    ext_dir = f"/sdcard/Android/data/{pkg}"
-    ext_out = adb_su(f"du -sh {ext_dir} 2>/dev/null")
-    if ext_out and "No such" not in ext_out and not ext_out.startswith("["):
-        ext_size = ext_out.split()[0] if ext_out.split() else None
-        if ext_size:
-            print(f"\n  {C.YELLOW}{C.BOLD}── STORAGE-9: External Storage (dynamic) ──{C.RST}")
-            info_line("External data on device", ext_size)
-
-    # ── Cleanup temp logcat file ─────────────────────────────────────────
-    try:
-        os.remove(logcat_tmp)
-    except Exception:
-        pass
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  Summary
-    # ══════════════════════════════════════════════════════════════════════
-    total = passes + fails + warns
-    score = int(passes / total * 100) if total else 0
-
-    print(f"\n  {C.CYAN}{'═'*56}{C.RST}")
-    print(f"  {C.BOLD}MASVS-STORAGE (L1) ASSESSMENT SUMMARY{C.RST}")
-    print(f"  {C.GREEN}PASS: {passes}{C.RST}  {C.RED}FAIL: {fails}{C.RST}  {C.YELLOW}WARN: {warns}{C.RST}")
-    print(f"  {C.DIM}Score: {score}% ({passes}/{total} checks passed){C.RST}")
-
-    if fails == 0 and warns == 0:
-        print(f"\n  {C.GREEN}{C.BOLD}Overall: COMPLIANT{C.RST}")
-        print(f"  {C.DIM}App meets MASVS-STORAGE L1 requirements.{C.RST}")
-    elif fails == 0:
-        print(f"\n  {C.YELLOW}{C.BOLD}Overall: PARTIALLY COMPLIANT{C.RST}")
-        print(f"  {C.DIM}No critical failures — {warns} warning(s) need review.{C.RST}")
-    else:
-        print(f"\n  {C.RED}{C.BOLD}Overall: NON-COMPLIANT{C.RST}")
-        print(f"  {C.DIM}{fails} test(s) failed — remediation required for MASVS-STORAGE L1.{C.RST}")
-
-    pause()
-
 # ─── Testcases for Fun ────────────────────────────────────────────────────────────
 
 def _parse_exported_components(manifest):
-    """Parse AndroidManifest.xml text and return exported activities, services, receivers."""
+    """Parse AndroidManifest.xml and return exported components with their intent-filter actions.
+
+    Returns dict like:
+        {"activity": [{"name": ".Foo", "actions": ["android.intent.action.VIEW"]}, ...], ...}
+    """
     exported = {"activity": [], "service": [], "receiver": []}
+    seen = {"activity": set(), "service": set(), "receiver": set()}
+
     for tag in exported:
+        # Match full component blocks: <tag ...>...</tag>
+        for block_m in re.finditer(
+            rf'<{tag}\s([^>]*?)>(.*?)</{tag}>',
+            manifest, re.IGNORECASE | re.DOTALL
+        ):
+            attrs, body = block_m.group(1), block_m.group(2)
+            # Check exported="true"
+            if not re.search(r'android:exported\s*=\s*"true"', attrs, re.IGNORECASE):
+                continue
+            # Extract name
+            name_m = re.search(r'android:name\s*=\s*"([^"]+)"', attrs)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            if name in seen[tag]:
+                continue
+            seen[tag].add(name)
+            # Extract actions from intent-filters
+            actions = []
+            for action_m in re.finditer(r'<action\s[^>]*android:name\s*=\s*"([^"]+)"', body):
+                act = action_m.group(1)
+                if act not in actions:
+                    actions.append(act)
+            exported[tag].append({"name": name, "actions": actions})
+
+        # Also handle self-closing tags: <tag ... /> (no intent-filters possible)
         for m in re.finditer(
-            rf'<{tag}\s[^>]*android:exported\s*=\s*"true"[^>]*android:name\s*=\s*"([^"]+)"',
+            rf'<{tag}\s([^>]*?)/\s*>',
             manifest, re.IGNORECASE
         ):
-            exported[tag].append(m.group(1))
-        for m in re.finditer(
-            rf'<{tag}\s[^>]*android:name\s*=\s*"([^"]+)"[^>]*android:exported\s*=\s*"true"',
-            manifest, re.IGNORECASE
-        ):
-            if m.group(1) not in exported[tag]:
-                exported[tag].append(m.group(1))
+            attrs = m.group(1)
+            if not re.search(r'android:exported\s*=\s*"true"', attrs, re.IGNORECASE):
+                continue
+            name_m = re.search(r'android:name\s*=\s*"([^"]+)"', attrs)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            if name in seen[tag]:
+                continue
+            seen[tag].add(name)
+            exported[tag].append({"name": name, "actions": []})
+
     return exported
 
 def fun_testcases(pkg):
@@ -3252,15 +3039,51 @@ def fun_testcases(pkg):
             if not acts:
                 print(f"  {C.DIM}No exported activities found.{C.RST}")
             else:
-                print(f"  {C.CYAN}Found {len(acts)} exported activit{'y' if len(acts) == 1 else 'ies'}{C.RST}\n")
-                for act in acts:
-                    print(f"  {C.DIM}Starting: {act}...{C.RST}")
-                    out = adb_shell(f"am start -n {pkg}/{act}", timeout=10)
+                print(f"  {C.CYAN}Found {len(acts)} exported activit{'y' if len(acts) == 1 else 'ies'}{C.RST}")
+
+                # Show list with actions
+                for i, comp in enumerate(acts, 1):
+                    action_str = f" {C.DIM}actions: {', '.join(comp['actions'])}{C.RST}" if comp['actions'] else ""
+                    print(f"    {C.YELLOW}[{i}]{C.RST} {comp['name']}{action_str}")
+
+                print(f"\n  {C.DIM}[a] Launch all  [0] Back{C.RST}")
+                print(f"  {C.DIM}Add extras: append after number, e.g. '1 --es key value --ei num 42'{C.RST}")
+                sel = input(f"\n  {C.GREEN}Select ▸ {C.RST}").strip()
+                if sel == "0":
+                    continue
+
+                targets = []
+                extra_args = ""
+                if sel.lower().startswith("a"):
+                    targets = acts
+                    rest = sel[1:].strip()
+                    if rest:
+                        extra_args = rest
+                else:
+                    parts = sel.split(maxsplit=1)
+                    try:
+                        idx = int(parts[0]) - 1
+                        if 0 <= idx < len(acts):
+                            targets = [acts[idx]]
+                        extra_args = parts[1] if len(parts) > 1 else ""
+                    except (ValueError, IndexError):
+                        print(f"  {C.RED}Invalid selection.{C.RST}")
+
+                for comp in targets:
+                    name = comp['name']
+                    # Build command: use first action from intent-filter if available
+                    cmd = f"am start -n {pkg}/{name}"
+                    if comp['actions']:
+                        cmd += f" -a {comp['actions'][0]}"
+                    if extra_args:
+                        cmd += f" {extra_args}"
+                    print(f"\n  {C.DIM}$ {cmd}{C.RST}")
+                    out = adb_shell(cmd, timeout=10)
                     if "Error" in out or "Exception" in out:
-                        print(f"  {C.RED}[✗]{C.RST} {act}")
-                        print(f"      {C.DIM}{out[:120]}{C.RST}")
+                        print(f"  {C.RED}[✗]{C.RST} {name}")
+                        print(f"      {C.DIM}{out[:200]}{C.RST}")
                     else:
-                        print(f"  {C.GREEN}[✓]{C.RST} {act} {C.YELLOW}— launched (potential auth bypass!){C.RST}")
+                        print(f"  {C.GREEN}[✓]{C.RST} {name} {C.YELLOW}— launched (potential auth bypass!){C.RST}")
                     time.sleep(0.5)
             pause()
 
@@ -3271,15 +3094,49 @@ def fun_testcases(pkg):
             if not svcs:
                 print(f"  {C.DIM}No exported services found.{C.RST}")
             else:
-                print(f"  {C.CYAN}Found {len(svcs)} exported service{'s' if len(svcs) != 1 else ''}{C.RST}\n")
-                for svc in svcs:
-                    print(f"  {C.DIM}Starting: {svc}...{C.RST}")
-                    out = adb_shell(f"am startservice -n {pkg}/{svc}", timeout=10)
+                print(f"  {C.CYAN}Found {len(svcs)} exported service{'s' if len(svcs) != 1 else ''}{C.RST}")
+
+                for i, comp in enumerate(svcs, 1):
+                    action_str = f" {C.DIM}actions: {', '.join(comp['actions'])}{C.RST}" if comp['actions'] else ""
+                    print(f"    {C.YELLOW}[{i}]{C.RST} {comp['name']}{action_str}")
+
+                print(f"\n  {C.DIM}[a] Launch all  [0] Back{C.RST}")
+                print(f"  {C.DIM}Add extras: append after number, e.g. '1 --es key value'{C.RST}")
+                sel = input(f"\n  {C.GREEN}Select ▸ {C.RST}").strip()
+                if sel == "0":
+                    continue
+
+                targets = []
+                extra_args = ""
+                if sel.lower().startswith("a"):
+                    targets = svcs
+                    rest = sel[1:].strip()
+                    if rest:
+                        extra_args = rest
+                else:
+                    parts = sel.split(maxsplit=1)
+                    try:
+                        idx = int(parts[0]) - 1
+                        if 0 <= idx < len(svcs):
+                            targets = [svcs[idx]]
+                        extra_args = parts[1] if len(parts) > 1 else ""
+                    except (ValueError, IndexError):
+                        print(f"  {C.RED}Invalid selection.{C.RST}")
+
+                for comp in targets:
+                    name = comp['name']
+                    cmd = f"am startservice -n {pkg}/{name}"
+                    if comp['actions']:
+                        cmd += f" -a {comp['actions'][0]}"
+                    if extra_args:
+                        cmd += f" {extra_args}"
+                    print(f"\n  {C.DIM}$ {cmd}{C.RST}")
+                    out = adb_shell(cmd, timeout=10)
                     if "Error" in out or "Exception" in out:
-                        print(f"  {C.RED}[✗]{C.RST} {svc}")
-                        print(f"      {C.DIM}{out[:120]}{C.RST}")
+                        print(f"  {C.RED}[✗]{C.RST} {name}")
+                        print(f"      {C.DIM}{out[:200]}{C.RST}")
                     else:
-                        print(f"  {C.GREEN}[✓]{C.RST} {svc} {C.YELLOW}— started{C.RST}")
+                        print(f"  {C.GREEN}[✓]{C.RST} {name} {C.YELLOW}— started{C.RST}")
                     time.sleep(0.5)
             pause()
 
@@ -3290,13 +3147,47 @@ def fun_testcases(pkg):
             if not rcvs:
                 print(f"  {C.DIM}No exported receivers found.{C.RST}")
             else:
-                print(f"  {C.CYAN}Found {len(rcvs)} exported receiver{'s' if len(rcvs) != 1 else ''}{C.RST}\n")
-                for rcv in rcvs:
-                    print(f"  {C.DIM}Broadcasting to: {rcv}...{C.RST}")
-                    out = adb_shell(f"am broadcast -n {pkg}/{rcv}", timeout=10)
+                print(f"  {C.CYAN}Found {len(rcvs)} exported receiver{'s' if len(rcvs) != 1 else ''}{C.RST}")
+
+                for i, comp in enumerate(rcvs, 1):
+                    action_str = f" {C.DIM}actions: {', '.join(comp['actions'])}{C.RST}" if comp['actions'] else ""
+                    print(f"    {C.YELLOW}[{i}]{C.RST} {comp['name']}{action_str}")
+
+                print(f"\n  {C.DIM}[a] Launch all  [0] Back{C.RST}")
+                print(f"  {C.DIM}Add extras: append after number, e.g. '1 --es key value'{C.RST}")
+                sel = input(f"\n  {C.GREEN}Select ▸ {C.RST}").strip()
+                if sel == "0":
+                    continue
+
+                targets = []
+                extra_args = ""
+                if sel.lower().startswith("a"):
+                    targets = rcvs
+                    rest = sel[1:].strip()
+                    if rest:
+                        extra_args = rest
+                else:
+                    parts = sel.split(maxsplit=1)
+                    try:
+                        idx = int(parts[0]) - 1
+                        if 0 <= idx < len(rcvs):
+                            targets = [rcvs[idx]]
+                        extra_args = parts[1] if len(parts) > 1 else ""
+                    except (ValueError, IndexError):
+                        print(f"  {C.RED}Invalid selection.{C.RST}")
+
+                for comp in targets:
+                    name = comp['name']
+                    cmd = f"am broadcast -n {pkg}/{name}"
+                    if comp['actions']:
+                        cmd += f" -a {comp['actions'][0]}"
+                    if extra_args:
+                        cmd += f" {extra_args}"
+                    print(f"\n  {C.DIM}$ {cmd}{C.RST}")
+                    out = adb_shell(cmd, timeout=10)
                     if "Error" in out or "Exception" in out:
-                        print(f"  {C.RED}[✗]{C.RST} {rcv}")
-                        print(f"      {C.DIM}{out[:120]}{C.RST}")
+                        print(f"  {C.RED}[✗]{C.RST} {name}")
+                        print(f"      {C.DIM}{out[:200]}{C.RST}")
                     else:
                         result_line = ""
                         for line in out.splitlines():
@@ -3304,9 +3195,9 @@ def fun_testcases(pkg):
                                 result_line = line.strip()
                                 break
                         if result_line:
-                            print(f"  {C.GREEN}[✓]{C.RST} {rcv} {C.DIM}— {result_line}{C.RST}")
+                            print(f"  {C.GREEN}[✓]{C.RST} {name} {C.DIM}— {result_line}{C.RST}")
                         else:
-                            print(f"  {C.GREEN}[✓]{C.RST} {rcv} {C.YELLOW}— broadcast sent{C.RST}")
+                            print(f"  {C.GREEN}[✓]{C.RST} {name} {C.YELLOW}— broadcast sent{C.RST}")
                     time.sleep(0.5)
             pause()
 
@@ -4074,9 +3965,7 @@ def main_menu(device_info, has_root, selected_pkg):
   ║  {C.YELLOW}[9]{C.CYAN} Binary Patcher                      ║
   ║      {C.DIM}Frida Gadget or LSPatch (Xposed){C.RST}{C.CYAN}    ║
   ║  {C.YELLOW}[10]{C.CYAN} Frida Server Config                ║
-  ║  {C.YELLOW}[11]{C.CYAN} MASVS-STORAGE Assessment           ║
-  ║      {C.DIM}OWASP Data Storage L1 (10 checks){C.RST}{C.CYAN}   ║
-  ║  {C.YELLOW}[12]{C.CYAN} Testcases for Fun                  ║
+  ║  {C.YELLOW}[11]{C.CYAN} Testcases for Fun                  ║
   ║      {C.DIM}Exported components, clipboard, URLs{C.RST}{C.CYAN} ║
   ║                                          ║
   ║  {C.YELLOW}[a]{C.CYAN} Switch App                          ║
@@ -4131,7 +4020,7 @@ def main():
         return
 
     # Options that require a selected app
-    APP_REQUIRED = {"1", "2", "5", "7", "8", "9", "11", "12"}
+    APP_REQUIRED = {"1", "2", "5", "7", "8", "9", "11"}
 
     while True:
         main_menu(device, has_root, selected_pkg)
@@ -4174,8 +4063,6 @@ def main():
         elif choice == "10":
             frida_server_config()
         elif choice == "11":
-            masvs_storage(selected_pkg)
-        elif choice == "12":
             fun_testcases(selected_pkg)
         elif choice == "0":
             print(f"\n  {C.CYAN}Goodbye.{C.RST}\n")
