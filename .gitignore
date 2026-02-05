@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.apkanalyzer_tmp/
+.apkpatcher_work/
+extracted_apks/
+pulled_files/
+screenshots/
