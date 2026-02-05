@@ -128,18 +128,27 @@ def check_device():
     return {"serial": serial, "model": model, "android": android_ver, "sdk": sdk}
 
 def check_root():
-    """Check if device has root access (su or adbd-root)."""
+    """Check if device has root access (su, adbd-root, or adb root restart)."""
     global _root_mode
-    # Try su first
-    out = adb(f'shell su -c "id"', timeout=10)
+    # 1) Try su -c (Magisk / SuperSU / rooted ROMs)
+    out = adb('shell su -c "id"', timeout=10)
     if "uid=0" in out:
         _root_mode = "su"
         return True
-    # Fallback: check if adb shell itself is root (emulators, adb root)
+    # 2) Check if adb shell already runs as root
     out = adb_shell("id", timeout=10)
     if "uid=0" in out:
         _root_mode = "adbd"
         return True
+    # 3) Try "adb root" to restart adbd as root (emulators / userdebug builds)
+    root_out = adb("root", timeout=15)
+    if root_out and "cannot" not in root_out.lower() and "unable" not in root_out.lower():
+        time.sleep(2)  # wait for adbd to restart
+        # Re-check connection after adbd restart
+        out = adb_shell("id", timeout=10)
+        if "uid=0" in out:
+            _root_mode = "adbd"
+            return True
     _root_mode = None
     return False
 
