@@ -1,10 +1,11 @@
 <div align="center">
 
-# APK Analyzer
+# 🛡️ APK Analyzer
 
-**All-in-one Android security analysis toolkit for penetration testers and security researchers.**
+### The Only Android Security Tool You'll Ever Need
 
-Decompile, scan, audit, patch, and hook Android apps — all from a single interactive terminal.
+**Static analysis. Dynamic analysis. Frida instrumentation. Binary patching.**
+**One tool. One terminal. Zero dependencies.**
 
 [![Python](https://img.shields.io/badge/Python-3.6+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -12,59 +13,114 @@ Decompile, scan, audit, patch, and hook Android apps — all from a single inter
 [![ADB](https://img.shields.io/badge/Requires-ADB%20%2B%20Root-orange)]()
 [![Frida](https://img.shields.io/badge/Frida-Integrated-blueviolet?logo=frida)](https://frida.re)
 
+<br>
+
+**⭐ If this tool saves you time, [give it a star](https://github.com/worldtreeboy/apkAnalyzer) — it helps others find it!**
+
 </div>
 
----
+<br>
 
-## Why APK Analyzer?
-
-Most Android security tools do **one thing** — a static scanner, a Frida wrapper, or a storage dumper. APK Analyzer combines **static analysis, dynamic analysis, Frida instrumentation, and binary patching** into a single workflow. Select your target app once, then run any of the 11 tools without switching between terminals.
-
-- **Zero Python dependencies** — pure stdlib, runs anywhere with Python 3.6+
-- **19-check security scan** — covers everything MobSF flags, from `allowBackup` to Janus CVE
-- **38 Frida scripts** — SSL bypass, root hiding, crypto monitoring, and more — ready to go
-- **Binary patching** — inject Frida Gadget or embed LSPosed/Xposed in one command
-- **Smart caching** — decompiles once, reuses across all scans
-
----
-
-## Quick Start
+## 🚀 Get Started in 10 Seconds
 
 ```bash
-# 1. Connect a rooted Android device via USB
-adb devices
-
-# 2. Run it
+git clone https://github.com/worldtreeboy/apkAnalyzer.git
+cd apkAnalyzer
 python3 apkAnalyzer.py
-
-# 3. Select your target app and go
 ```
 
-> **That's it.** No `pip install`, no Docker, no config files. Frida server starts automatically.
+> **That's it.** No `pip install`. No Docker. No config files. Just plug in a rooted device and go.
 
----
+<br>
 
-## Features
+## 🎬 Demo
 
-| # | Feature | Description |
+```
+┌──────────────────────────────────────────────────────┐
+│              APK Analyzer — Main Menu                 │
+│         github.com/worldtreeboy/apkAnalyzer          │
+├──────────────────────────────────────────────────────┤
+│  Target: com.example.app (v2.1.0)                    │
+│  Device: Pixel 6 (Android 14)                        │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│   [1]  App Analysis          [7]  Logcat Monitor     │
+│   [2]  Storage Audit         [8]  Frida CodeShare    │
+│   [3]  Shell Access          [9]  Binary Patcher     │
+│   [4]  Screenshot            [10] Frida Server       │
+│   [5]  Security Scan         [11] Testcases          │
+│   [6]  Keyboard Cache                                │
+│                                                      │
+│   [a]  Switch App   [q]  Quit                        │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+```
+═══════════════════════════════════════════════════════
+  SECURITY SCAN — com.example.app
+═══════════════════════════════════════════════════════
+
+  [FAIL] Debuggable                 android:debuggable="true"
+  [FAIL] allowBackup                No exclusion rules defined
+  [PASS] Cleartext Traffic          usesCleartextTraffic="false"
+  [WARN] Exported Components        3 activities, 1 provider exported
+  [FAIL] Hardcoded Secrets          Found AWS key in config.xml
+  [PASS] Network Security Config    Custom config with certificate pins
+  [FAIL] APK Signing                v1-only — Janus vulnerable (CVE-2017-13156)
+  ...
+  ─────────────────────────────────────────────────────
+  Results: 11 PASS │ 5 FAIL │ 3 WARN
+═══════════════════════════════════════════════════════
+```
+
+> 📹 **Want to see it live?** Record your own session with [asciinema](https://asciinema.org) and share it!
+
+<br>
+
+## 💡 Why APK Analyzer?
+
+Most Android security tools do **one thing** — a static scanner, a Frida wrapper, or a storage dumper. You end up with 10 terminals open, copying package names between tools.
+
+**APK Analyzer replaces all of them.**
+
+| | What You Get |
+|:-:|---|
+| 🔍 | **19 security checks** in one scan — everything MobSF flags, from `allowBackup` to Janus CVE |
+| 🎣 | **38 Frida scripts** ready to inject — SSL bypass, root hiding, crypto monitoring |
+| 🧬 | **Universal bypass script** — SSL + root + anti-tamper in a single file |
+| 🔧 | **Binary patching** — Frida Gadget or LSPatch injection in one command |
+| 📦 | **Zero dependencies** — pure Python stdlib, no pip, no Docker |
+| ⚡ | **Smart caching** — decompile once, reuse across all 11 tools |
+| 🔎 | **~40 secret patterns** — catches AWS, Firebase, Stripe, GitHub tokens & more |
+| 🤖 | **Framework-aware** — auto-detects Flutter, React Native, Kotlin and adjusts scans |
+
+<br>
+
+## 📋 All 11 Features
+
+| # | Feature | What It Does |
 |:-:|---------|-------------|
 | 1 | **App Analysis** | Permissions, components, version info, framework detection, APK extraction |
-| 2 | **Storage Audit** | Scan SharedPrefs, SQLite, Realm DBs for secrets & PII. File permission checks. EncryptedSharedPreferences detection |
+| 2 | **Storage Audit** | SharedPrefs, SQLite, Realm DBs — scan for secrets, PII, and insecure file permissions |
 | 3 | **Shell Access** | Interactive root shell with directory tracking |
 | 4 | **Screenshot** | Capture device screen, save locally with timestamp |
-| 5 | **Security Scan** | 19 static checks with PASS/FAIL/WARN scoring ([details below](#security-scan-19-checks)) |
-| 6 | **Keyboard Cache** | Detect if LokiBoard caches plaintext input |
+| 5 | **Security Scan** | 19 static checks scored PASS / FAIL / WARN ([details below](#-security-scan-19-checks)) |
+| 6 | **Keyboard Cache** | Detect if keyboard apps cache plaintext input |
 | 7 | **Logcat Monitor** | Real-time filtered log streaming with keyword highlighting |
-| 8 | **Frida CodeShare** | 38 pre-configured scripts across 10 categories ([details below](#frida-codeshare-38-scripts)) |
-| 9 | **Binary Patcher** | Frida Gadget injection or LSPatch (Xposed) embedding ([details below](#binary-patcher)) |
-| 10 | **Frida Server Config** | USB/remote mode switching, port forwarding, server management |
+| 8 | **Frida CodeShare** | 38 scripts across 10 categories — inject from menu ([details below](#-frida-codeshare-38-scripts)) |
+| 9 | **Binary Patcher** | Frida Gadget injection or LSPatch/Xposed embedding ([details below](#-binary-patcher)) |
+| 10 | **Frida Server** | USB/remote mode switching, port forwarding, auto server management |
 | 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder |
+
+<br>
 
 ---
 
-## Security Scan (19 Checks)
+<details>
+<summary><h2>🔒 Security Scan (19 Checks)</h2></summary>
 
-Static analysis of the decompiled APK and AndroidManifest.xml. Results scored as PASS / FAIL / WARN.
+Static analysis of the decompiled APK and AndroidManifest.xml. Results scored as **PASS** / **FAIL** / **WARN**.
 
 <table>
 <tr><th>Category</th><th>Check</th><th>What It Flags</th></tr>
@@ -94,9 +150,10 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Results scored as
 <tr><td>APK Signing</td><td>v1-only = Janus vulnerability (CVE-2017-13156). Checks v1/v2/v3/v4</td></tr>
 </table>
 
----
+</details>
 
-## Secret Detection
+<details>
+<summary><h2>🔑 Secret Detection (~40 Patterns)</h2></summary>
 
 Both **Storage Audit** and **Security Scan** use ~40 regex patterns to catch hardcoded secrets:
 
@@ -112,11 +169,12 @@ Both **Storage Audit** and **Security Scan** use ~40 regex patterns to catch har
 | **Database** | MongoDB, Postgres, MySQL, Redis connection strings |
 | **Crypto** | PEM private keys, certificates |
 
----
+</details>
 
-## Custom Frida Script
+<details>
+<summary><h2>🧬 Custom Frida Script (Universal Bypass)</h2></summary>
 
-`frida_scripts/universal_bypass.js` — a single all-in-one script that bypasses SSL pinning, root detection, and runtime tampering simultaneously. More comprehensive than any individual CodeShare script.
+`frida_scripts/universal_bypass.js` — a single all-in-one script that bypasses **SSL pinning**, **root detection**, and **runtime tampering** simultaneously. More comprehensive than any individual CodeShare script.
 
 ```bash
 frida -U -f <package> -l frida_scripts/universal_bypass.js
@@ -124,15 +182,16 @@ frida -U -f <package> -l frida_scripts/universal_bypass.js
 
 | Layer | What It Bypasses |
 |-------|-----------------|
-| **SSL Pinning** | TrustManager, TrustManagerFactory, HostnameVerifier, OkHttp3 CertificatePinner, Conscrypt, TrustKit, WebView SSL, Flutter BoringSSL, Apache HTTP |
-| **Root Detection** | File.exists (30+ paths), PackageManager (20+ root packages), Runtime.exec, ProcessBuilder, Build.TAGS, SystemProperties, RootBeer library, native fopen/access |
-| **Runtime Tampering** | Anti-Frida (port 27042, /proc/maps, string detection), anti-debug (ptrace, isDebuggerConnected), System.exit blocking, emulator detection, Xposed detection, process kill prevention |
+| **SSL Pinning** | TrustManager, TrustManagerFactory, HostnameVerifier, OkHttp3 CertificatePinner (+ proguarded), Conscrypt, TrustKit, WebView SSL, Flutter BoringSSL, Apache HTTP |
+| **Root Detection** | File.exists (30+ paths), PackageManager (20+ root packages), Runtime.exec, ProcessBuilder, Build.TAGS, SystemProperties, RootBeer library, native fopen/access/stat |
+| **Runtime Tampering** | Anti-Frida (port 27042, /proc/maps, native strstr), anti-debug (ptrace, TracerPid spoofing), System.exit blocking, emulator detection, Xposed detection, process kill prevention |
 
-Every hook is wrapped in try/catch — if a class isn't present, it silently skips instead of crashing.
+Every hook is wrapped in try/catch — if a class isn't present, it silently skips instead of crashing. Unique class names prevent collision on script reload.
 
----
+</details>
 
-## Frida CodeShare (38 Scripts)
+<details>
+<summary><h2>🎣 Frida CodeShare (38 Scripts)</h2></summary>
 
 Auto-starts `frida-server` on device. Run scripts from local files or the built-in library:
 
@@ -149,9 +208,10 @@ Auto-starts `frida-server` on device. Run scripts from local files or the built-
 | **Intent / WebView** | Intent Intercept, Deep Link Observer, WebView Debugger |
 | **Tracing** | raptor Tracer, JNI Trace, List Classes, DEX Dump |
 
----
+</details>
 
-## Binary Patcher
+<details>
+<summary><h2>🔧 Binary Patcher</h2></summary>
 
 Two methods for non-rooted analysis:
 
@@ -173,9 +233,10 @@ Check java → Download LSPatch → Get APK → Patch
 → Output: patched_apks/
 ```
 
----
+</details>
 
-## Framework Detection
+<details>
+<summary><h2>🤖 Framework Detection</h2></summary>
 
 Scans automatically detect the app framework and adjust keyword groups:
 
@@ -188,48 +249,42 @@ Scans automatically detect the app framework and adjust keyword groups:
 
 Native security SDKs (VKey, Zimperium, Promon, DexGuard) are detected from `.so` files on every scan.
 
+</details>
+
 ---
 
-## Requirements
+## 📦 Requirements
 
 | Requirement | Required | Notes |
 |-------------|:--------:|-------|
-| Python 3.6+ | Yes | No pip packages needed |
-| ADB | Yes | Must be in PATH |
-| Rooted device | Yes | Connected via USB |
-| `apktool` | Yes | [Install](https://ibotpeaches.github.io/Apktool/) — required for decompilation |
-| `apksigner` | Optional | Android SDK build-tools — for APK signing scheme check |
-| `frida` + `frida-tools` | Optional | For Frida CodeShare scripts |
+| Python 3.6+ | **Yes** | No pip packages needed |
+| ADB | **Yes** | Must be in PATH |
+| Rooted device | **Yes** | Connected via USB |
+| `apktool` | **Yes** | [Install guide](https://ibotpeaches.github.io/Apktool/) |
+| `apksigner` | Optional | For APK signing scheme check |
+| `frida` + `frida-tools` | Optional | For Frida scripts |
 
 ---
 
-## How It Works
+## 📁 Output Structure
 
 ```
-python3 apkAnalyzer.py
-```
-
-1. Connects to device via ADB, starts `frida-server` automatically
-2. Lists third-party apps (`pm list packages -3`), you pick your target
-3. All 11 features operate on the selected app — press `[a]` to switch anytime
-
-```
-./extracted_apks/      ← Extracted APKs
-./patched_apks/        ← Patched APKs (Gadget / LSPatch)
+./extracted_apks/      ← Pulled APKs from device
+./patched_apks/        ← Frida Gadget / LSPatch output
 ./screenshots/         ← Device screenshots
-./.gadget_cache/       ← Frida Gadget & LSPatch jar cache
+./.gadget_cache/       ← Cached Frida Gadget & LSPatch jar
 ./.apkanalyzer_tmp/    ← Decompiled APK cache (reused across scans)
 ```
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
-Contributions are welcome! Feel free to open issues or submit pull requests.
+Contributions are welcome! Feel free to [open an issue](https://github.com/worldtreeboy/apkAnalyzer/issues) or submit a pull request.
 
 ---
 
-## License
+## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
 
@@ -237,6 +292,12 @@ This project is licensed under the [MIT License](LICENSE).
 
 <div align="center">
 
-**If this tool helped you, consider giving it a star to help others find it!**
+### ⭐ Found this useful?
+
+**If APK Analyzer saved you time, [star this repo](https://github.com/worldtreeboy/apkAnalyzer)** — it helps other security researchers discover it.
+
+<br>
+
+[![Star History Chart](https://api.star-history.com/svg?repos=worldtreeboy/apkAnalyzer&type=Date)](https://star-history.com/#worldtreeboy/apkAnalyzer&Date)
 
 </div>
