@@ -35,7 +35,7 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 adb devices
 
 # 2. Run it
-python3 apkanalyzer.py
+python3 apkAnalyzer.py
 
 # 3. Select your target app and go
 ```
@@ -188,7 +188,7 @@ Native security SDKs (VKey, Zimperium, Promon, DexGuard) are detected from `.so`
 ## How It Works
 
 ```
-python3 apkanalyzer.py
+python3 apkAnalyzer.py
 ```
 
 1. Connects to device via ADB, starts `frida-server` automatically
