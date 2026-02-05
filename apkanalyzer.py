@@ -1080,7 +1080,28 @@ def storage_audit(pkg):
                     kv_pairs.append((m.group(1), m.group(2), m.group(3)))
 
                 if kv_pairs:
-                    sensitive_keys = ['token', 'key', 'secret', 'password', 'auth', 'session', 'jwt', 'credential', 'pin', 'otp']
+                    sensitive_keys = [
+                        # Auth & credentials
+                        'token', 'key', 'secret', 'password', 'passwd', 'pwd',
+                        'auth', 'session', 'jwt', 'credential', 'pin', 'otp',
+                        'login', 'username', 'user_name', 'userid', 'user_id',
+                        # PII
+                        'email', 'mail', 'phone', 'mobile', 'number', 'address',
+                        'name', 'fullname', 'first_name', 'last_name', 'dob',
+                        'birth', 'ssn', 'social', 'national_id', 'passport',
+                        'license', 'gender', 'age',
+                        # Financial
+                        'account', 'balance', 'credit', 'debit', 'card',
+                        'iban', 'routing', 'swift', 'payment', 'bank',
+                        'amount', 'transaction', 'wallet',
+                        # Crypto / keys
+                        'private', 'cert', 'certificate', 'signing',
+                        'encryption', 'master', 'api', 'bearer', 'refresh',
+                        'access', 'client_id', 'client_secret',
+                        # Device / tracking
+                        'imei', 'imsi', 'device_id', 'mac_address',
+                        'serial', 'fingerprint', 'biometric',
+                    ]
                     flagged = [(ktype, kname, kval) for ktype, kname, kval in kv_pairs
                                if any(sk in kname.lower() for sk in sensitive_keys)]
                     if flagged:
@@ -1194,6 +1215,85 @@ def storage_audit(pkg):
             is_encrypted = header and "5265 616c 6d" not in header  # "Realm" magic bytes
             enc_tag = f" {C.GREEN}[ENCRYPTED]{C.RST}" if is_encrypted else f" {C.RED}[UNENCRYPTED]{C.RST}"
             print(f"    {C.CYAN}🗄  {fname}{C.RST} {C.DIM}({fsize} bytes){C.RST}{enc_tag}")
+
+    # ── Recursive scan of ALL remaining files ──────────────────────────────
+    # Files already inspected above (SharedPrefs, DBs, Realm) are skipped
+    inspected = set(sp_files + db_files + realm_files)
+    other_files = [f for f in all_files if f not in inspected]
+
+    if other_files:
+        print(f"\n  {C.YELLOW}{C.BOLD}── Other Files (files/, cache/, etc.) ──{C.RST}")
+        print(f"  {C.DIM}Scanning {len(other_files)} remaining file(s) for sensitive data...{C.RST}")
+
+        highlight_kw = [
+            'token', 'key', 'secret', 'password', 'passwd', 'pwd', 'auth',
+            'session', 'jwt', 'credential', 'pin', 'otp', 'login', 'username',
+            'email', 'mail', 'phone', 'mobile', 'account', 'balance', 'credit',
+            'card', 'iban', 'payment', 'bank', 'amount', 'transaction', 'wallet',
+            'private', 'cert', 'api', 'bearer', 'refresh', 'access',
+            'imei', 'imsi', 'device_id', 'ssn', 'address', 'name', 'dob',
+            'fingerprint', 'biometric', 'number',
+        ]
+        other_secrets = 0
+
+        for of in other_files:
+            fname = os.path.basename(of)
+            rel_path = of.replace(data_dir + "/", "")
+            content = adb_su(f"cat {of} 2>/dev/null", timeout=10)
+
+            # Skip binary / empty / error responses
+            if not content or content.startswith("["):
+                continue
+            # Basic binary check: if too many non-printable chars, skip
+            sample = content[:512]
+            non_print = sum(1 for ch in sample if ord(ch) < 32 and ch not in '\n\r\t')
+            if non_print > len(sample) * 0.3:
+                print(f"\n    {C.CYAN}{rel_path}{C.RST} {C.DIM}[binary, skipped]{C.RST}")
+                continue
+
+            lines = content.splitlines()
+            preview = lines[:5]
+
+            # Check for keyword hits in full content
+            content_lower = content.lower()
+            hits = [kw for kw in highlight_kw if kw in content_lower]
+
+            # Check SECRET_PATTERNS
+            secret_hits = []
+            for pattern in SECRET_PATTERNS:
+                matches = re.findall(pattern, content)
+                if matches:
+                    for m in matches[:2]:
+                        val = m if isinstance(m, str) else m[0]
+                        secret_hits.append(val[:80])
+
+            if secret_hits:
+                other_secrets += 1
+
+            hit_tag = ""
+            if hits:
+                hit_tag = f" {C.RED}[SENSITIVE: {', '.join(hits[:5])}]{C.RST}"
+            elif not secret_hits:
+                hit_tag = f" {C.DIM}[no keywords]{C.RST}"
+
+            print(f"\n    {C.CYAN}{rel_path}{C.RST} {C.DIM}({len(lines)} lines){C.RST}{hit_tag}")
+            for pl in preview:
+                line_display = pl.rstrip()
+                # Highlight matching keywords in the line
+                for kw in hits:
+                    pat = re.compile(re.escape(kw), re.IGNORECASE)
+                    line_display = pat.sub(f"{C.RED}{C.BOLD}\\g<0>{C.RST}{C.DIM}", line_display)
+                print(f"      {C.DIM}{line_display}{C.RST}")
+            if len(lines) > 5:
+                print(f"      {C.DIM}... ({len(lines) - 5} more lines){C.RST}")
+
+            for sh in secret_hits:
+                print(f"      {C.RED}⚠ Potential secret: {sh}{C.RST}")
+
+        if other_secrets == 0:
+            print(f"\n    {C.GREEN}No secrets detected in other files.{C.RST}")
+        else:
+            print(f"\n    {C.RED}⚠ Found potential secrets in {other_secrets} file(s).{C.RST}")
 
     # File Permission Check (world-readable)
     print(f"\n  {C.YELLOW}{C.BOLD}── File Permissions ──{C.RST}")
