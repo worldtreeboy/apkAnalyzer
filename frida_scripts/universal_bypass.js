@@ -1,844 +1,1186 @@
 /*
- * Universal Bypass — SSL Pinning + Root Detection + Runtime Tampering
+ * Universal Bypass v17 — The Pre-Emptive Strike
  *
- * Single script that combines:
- *   1. SSL Pinning Bypass (TrustManager, OkHttp, Conscrypt, WebView, Flutter)
- *   2. Root Detection Bypass (file checks, packages, properties, native access)
- *   3. Runtime Tampering Bypass (anti-Frida, anti-debug, integrity checks)
+ * Philosophy: Be faster than the enemy's constructor.
  *
- * Every hook is wrapped in try/catch to prevent crashes.
- * Unique class names use timestamps to prevent collision on reload.
+ * v17 Changes (from v16):
+ *   - CRITICAL FIX: v16's dlopen onLeave was TOO LATE — by the time dlopen
+ *     returns, DT_INIT_ARRAY has already run and crashed at 0x66ff4.
+ *   - NEW METHOD A: Hook linker's call_constructors(). This fires AFTER the
+ *     module's segments are mmap'd but BEFORE DT_INIT/DT_INIT_ARRAY execute.
+ *     We scan for the target module and patch it in the pre-constructor window.
+ *   - NEW METHOD B: Hook mmap in linker64 (or libc fallback). Track the fd
+ *     returned by openat for libvosWrapperEx.so. When mmap maps the .text
+ *     segment containing offset 0x66ff4, patch it instantly — even before
+ *     call_constructors fires.
+ *   - METHOD C (safety net): dlopen onLeave kept as final fallback.
+ *   - NEW: __system_property_read_callback hook (Android 12+ native path)
+ *     in addition to __system_property_get.
+ *   - KEPT: MemFD Phantom, thread stealth, abort auto-NOP, full lobotomy,
+ *     string neutralizer, readlink concealment, stat camouflage.
+ *
+ * Hook timeline during library load:
+ *   1. openat("libvosWrapperEx.so")      → fd tracked
+ *   2. mmap(fd, offset, len) returns      → PATCH 0x66ff4 (Method B)
+ *   3. call_constructors(soinfo*)         → PATCH if not yet done (Method A)
+ *   4. DT_INIT_ARRAY runs                → 0x66ff4 is already RET → no crash
+ *   5. android_dlopen_ext returns         → full lobotomy scan (Method C)
+ *
+ * Architecture: Pure Interceptor + Memory.patchCode. No Stalker. No Java.
+ *
+ * ARM64 instruction encodings:
+ *   NOP = 0xd503201f  |  RET = 0xd65f03c0
+ *   BL  = 0x94000000 | (imm26 & 0x03FFFFFF)
  *
  * Usage:
- *   frida -U -f <package> -l universal_bypass.js
- *   frida -U <package> -l universal_bypass.js
+ *   frida -U -f <package> -l universal_bypass.js --no-pause
  */
 
-var Color = {
-    RED:    '\x1b[31m',
-    GREEN:  '\x1b[32m',
-    YELLOW: '\x1b[33m',
-    CYAN:   '\x1b[36m',
-    RESET:  '\x1b[0m',
-    BOLD:   '\x1b[1m',
-    DIM:    '\x1b[2m'
-};
+"use strict";
 
-var _uid = Date.now();
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LOGGING
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function log(tag, msg) {
-    var colors = {
-        'SSL':     Color.GREEN,
-        'ROOT':    Color.CYAN,
-        'TAMPER':  Color.YELLOW,
-        'ERROR':   Color.RED
-    };
-    var c = colors[tag] || Color.RESET;
-    console.log(c + Color.BOLD + '[' + tag + ']' + Color.RESET + ' ' + msg);
+function _log(prefix, msg) { console.log(prefix + " " + msg); }
+function logBypass(msg)  { _log("[+] BYPASS:", msg); }
+function logInfo(msg)    { _log("[*] INFO:", msg); }
+function logError(msg)   { _log("[!] ERROR:", msg); }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var ROOT_FRAGMENTS = [
+    "su", "magisk", "supersu", "daemonsu", "zygisk",
+    "busybox", "titanium", "substrate", "xposed",
+    "lsposed", "edxposed", "riru",
+    "/sbin/su", "/data/local/tmp",
+];
+
+var FRIDA_FRAGMENTS = [
+    "frida", "gum-js", "gmain", "linjector",
+    "re.frida.server", "frida-agent", "frida-gadget",
+    "agent.so", "frida-server",
+];
+
+var MAPS_FILTER = [
+    "frida", "gum-js", "re.frida", "agent.so",
+    "linjector", "gmain", "gadget",
+    "memfd:frida", "memfd:jit-cache",
+    "/data/local/tmp",
+];
+
+var RASP_LIBS = [
+    "libvkey", "libmos", "libpromon", "libshield",
+    "libAppSealing", "libzim", "libtalsec",
+    "libDexGuard", "libguard", "libsecure",
+];
+
+// ARM64
+var ARM64_NOP = 0xd503201f;
+var ARM64_RET = 0xd65f03c0;
+
+// V-Key target
+var CRASH_OFFSET = 0x66ff4;
+var SCAN_WINDOW  = 4096;
+var VKEY_NAMES   = ["libvosWrapperEx.so", "libvosWrapper.so", "vosWrapperEx"];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function resolveExport(name) {
+    try {
+        var p = Module.findExportByName(null, name);
+        if (p !== null && !p.isNull()) return p;
+    } catch (e) { }
+    try {
+        var libc = Process.findModuleByName("libc.so");
+        if (libc) {
+            var p = libc.findExportByName(name);
+            if (p !== null && !p.isNull()) return p;
+        }
+    } catch (e) { }
+    try {
+        var libdl = Process.findModuleByName("libdl.so");
+        if (libdl) {
+            var p = libdl.findExportByName(name);
+            if (p !== null && !p.isNull()) return p;
+        }
+    } catch (e) { }
+    return null;
+}
+
+function containsAny(str, fragments) {
+    if (!str) return false;
+    var lower = str.toLowerCase();
+    for (var i = 0; i < fragments.length; i++) {
+        if (lower.indexOf(fragments[i].toLowerCase()) !== -1) return true;
+    }
+    return false;
+}
+
+function isVKeyPath(path) {
+    if (!path) return false;
+    return path.indexOf("vosWrapper") !== -1 || path.indexOf("libvos") !== -1;
+}
+
+function findVKeyModule() {
+    for (var i = 0; i < VKEY_NAMES.length; i++) {
+        var m = Process.findModuleByName(VKEY_NAMES[i]);
+        if (m) return m;
+    }
+    return null;
+}
+
+var _hookCount = 0;
+var _myPid = Process.id;
+
+function safeAttach(name, callbacks) {
+    var p = resolveExport(name);
+    if (!p) {
+        logError(name + " -- NOT FOUND");
+        return false;
+    }
+    try {
+        Interceptor.attach(p, callbacks);
+        _hookCount++;
+        return true;
+    } catch (e) {
+        logError(name + " -- attach failed: " + e);
+        return false;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  1. SSL PINNING BYPASS
+//  MEMORY PATCHING ENGINE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function bypassSSL() {
+var _patchedAddrs = {};
 
-    // ── Custom TrustManager that trusts all certificates ────────────────
+function writeNop(addr) {
+    var key = addr.toString();
+    if (_patchedAddrs[key]) return false;
     try {
-        var X509TrustManager = Java.use('javax.net.ssl.X509TrustManager');
-        var SSLContext = Java.use('javax.net.ssl.SSLContext');
-        var TrustManager = Java.registerClass({
-            name: 'com.bypass.TrustManager_' + _uid,
-            implements: [X509TrustManager],
-            methods: {
-                checkClientTrusted: function (chain, authType) { },
-                checkServerTrusted: function (chain, authType) { },
-                getAcceptedIssuers: function () { return []; }
-            }
-        });
-        var TrustManagers = [TrustManager.$new()];
-        var sslContext = SSLContext.getInstance('TLS');
-        sslContext.init(null, TrustManagers, Java.use('java.security.SecureRandom').$new());
-        SSLContext.getInstance.overload('java.lang.String').implementation = function (protocol) {
-            var ctx = this.getInstance(protocol);
-            ctx.init(null, TrustManagers, Java.use('java.security.SecureRandom').$new());
-            return ctx;
-        };
-        log('SSL', 'Custom TrustManager installed (trusts all certs)');
+        Memory.patchCode(addr, 4, function (code) { code.writeU32(ARM64_NOP); });
+        _patchedAddrs[key] = true;
+        return true;
     } catch (e) {
-        log('ERROR', 'TrustManager: ' + e);
+        logError("[PATCH] NOP failed @ " + addr + ": " + e);
+        return false;
     }
+}
 
-    // ── TrustManagerFactory — return our TrustManager ───────────────────
+function writeRet(addr) {
+    var key = addr.toString();
+    if (_patchedAddrs[key]) return false;
     try {
-        var TrustManagerFactory = Java.use('javax.net.ssl.TrustManagerFactory');
-        var tmfUid = _uid;
-        TrustManagerFactory.getTrustManagers.implementation = function () {
-            var X509TM = Java.use('javax.net.ssl.X509TrustManager');
-            var fakeTM = Java.registerClass({
-                name: 'com.bypass.FakeTMF_' + tmfUid + '_' + this.hashCode(),
-                implements: [X509TM],
-                methods: {
-                    checkClientTrusted: function () { },
-                    checkServerTrusted: function () { },
-                    getAcceptedIssuers: function () { return []; }
-                }
-            });
-            return [fakeTM.$new()];
-        };
-        log('SSL', 'TrustManagerFactory.getTrustManagers hooked');
+        Memory.patchCode(addr, 4, function (code) { code.writeU32(ARM64_RET); });
+        _patchedAddrs[key] = true;
+        return true;
     } catch (e) {
-        log('ERROR', 'TrustManagerFactory: ' + e);
+        logError("[PATCH] RET failed @ " + addr + ": " + e);
+        return false;
     }
+}
 
-    // ── HostnameVerifier — accept all hostnames ─────────────────────────
-    try {
-        var HostnameVerifier = Java.use('javax.net.ssl.HostnameVerifier');
-        var AllowAll = Java.registerClass({
-            name: 'com.bypass.AllHostsVerifier_' + _uid,
-            implements: [HostnameVerifier],
-            methods: {
-                verify: function () { return true; }
-            }
-        });
-        var HttpsURLConnection = Java.use('javax.net.ssl.HttpsURLConnection');
-        HttpsURLConnection.setDefaultHostnameVerifier(AllowAll.$new());
-        HttpsURLConnection.setHostnameVerifier.implementation = function (v) {
-            return;
-        };
-        log('SSL', 'HostnameVerifier set to accept all');
-    } catch (e) {
-        log('ERROR', 'HostnameVerifier: ' + e);
-    }
-
-    // ── OkHttp3 CertificatePinner ───────────────────────────────────────
-    try {
-        var CertPinner = Java.use('okhttp3.CertificatePinner');
-        CertPinner.check.overload('java.lang.String', 'java.util.List').implementation = function () { };
-        log('SSL', 'OkHttp3 CertificatePinner.check bypassed');
-    } catch (e) { /* OkHttp3 not present */ }
-
-    try {
-        var CertPinner = Java.use('okhttp3.CertificatePinner');
-        CertPinner.check.overload('java.lang.String', '[Ljava.security.cert.Certificate;').implementation = function () { };
-    } catch (e) { /* overload not present */ }
-
-    // ── OkHttp3 check$okhttp (proguarded / newer versions) ─────────────
-    try {
-        var CertPinner = Java.use('okhttp3.CertificatePinner');
-        if (CertPinner['check$okhttp'] !== undefined) {
-            CertPinner['check$okhttp'].implementation = function () { };
-            log('SSL', 'OkHttp3 check$okhttp bypassed');
-        }
-    } catch (e) { /* not present */ }
-
-    // ── OkHttp3 CertificatePinner$Builder — empty pinning ──────────────
-    try {
-        var Builder = Java.use('okhttp3.CertificatePinner$Builder');
-        Builder.add.implementation = function (hostname) {
-            return this;
-        };
-        log('SSL', 'OkHttp3 CertificatePinner.Builder.add bypassed');
-    } catch (e) { /* not present */ }
-
-    // ── OkHttp3 proguarded pinner (scan for pin-checking classes) ───────
-    try {
-        // Find classes that have a 'check' method taking String + List
-        // and a field named 'pins' or similar — common obfuscated pattern
-        Java.enumerateLoadedClasses({
-            onMatch: function (className) {
-                // Only scan likely obfuscated short names
-                if (className.length > 3 && className.length < 15 && className.indexOf('.') !== -1) {
-                    try {
-                        var cls = Java.use(className);
-                        // Check for CertificatePinner-like method signatures
-                        if (cls.check !== undefined) {
-                            var overloads = cls.check.overloads;
-                            for (var i = 0; i < overloads.length; i++) {
-                                var params = overloads[i].argumentTypes;
-                                if (params.length === 2 &&
-                                    params[0].className === 'java.lang.String' &&
-                                    params[1].className === 'java.util.List') {
-                                    overloads[i].implementation = function () { };
-                                    log('SSL', 'Proguarded pinner bypassed: ' + className + '.check()');
-                                }
-                            }
-                        }
-                    } catch (e) { /* skip */ }
-                }
-            },
-            onComplete: function () { }
-        });
-    } catch (e) { /* not critical */ }
-
-    // ── Appmattus CertificateTransparency ───────────────────────────────
-    try {
-        var CTInterceptor = Java.use('com.appmattus.certificatetransparency.internal.CertificateTransparencyInterceptor');
-        CTInterceptor.intercept.implementation = function (chain) {
-            return chain.proceed(chain.request());
-        };
-        log('SSL', 'Appmattus CertificateTransparency bypassed');
-    } catch (e) { /* not present */ }
-
-    // ── TrustKit ────────────────────────────────────────────────────────
-    try {
-        var TrustKit = Java.use('com.datatheorem.android.trustkit.pinning.OkHostnameVerifier');
-        TrustKit.verify.overload('java.lang.String', 'javax.net.ssl.SSLSession').implementation = function () { return true; };
-        TrustKit.verify.overload('java.lang.String', 'java.security.cert.X509Certificate').implementation = function () { return true; };
-        log('SSL', 'TrustKit OkHostnameVerifier bypassed');
-    } catch (e) { /* not present */ }
-
-    // ── Conscrypt (modern TLS provider) ─────────────────────────────────
-    try {
-        var Platform = Java.use('com.android.org.conscrypt.Platform');
-        Platform.checkServerTrusted.overload('javax.net.ssl.X509TrustManager', '[Ljava.security.cert.X509Certificate;', 'java.lang.String', 'com.android.org.conscrypt.AbstractConscryptSocket').implementation = function () { };
-        log('SSL', 'Conscrypt Platform.checkServerTrusted bypassed');
-    } catch (e) { /* not present */ }
-
-    try {
-        var ConscryptTM = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-        ConscryptTM.verifyChain.implementation = function (untrusted) {
-            return untrusted;
-        };
-        log('SSL', 'Conscrypt TrustManagerImpl.verifyChain bypassed');
-    } catch (e) { /* not present */ }
-
-    // ── Android WebView SSL errors ──────────────────────────────────────
-    try {
-        var WebViewClient = Java.use('android.webkit.WebViewClient');
-        WebViewClient.onReceivedSslError.implementation = function (view, handler, error) {
-            handler.proceed();
-        };
-        log('SSL', 'WebViewClient.onReceivedSslError — auto-proceed');
-    } catch (e) {
-        log('ERROR', 'WebViewClient SSL: ' + e);
-    }
-
-    // ── AbstractVerifier (Apache HTTP legacy) ───────────────────────────
-    try {
-        var AbstractVerifier = Java.use('org.apache.http.conn.ssl.AbstractVerifier');
-        AbstractVerifier.verify.overload('java.lang.String', '[Ljava.lang.String;', '[Ljava.lang.String;', 'boolean').implementation = function () { };
-        log('SSL', 'Apache AbstractVerifier bypassed');
-    } catch (e) { /* not present */ }
-
-    // ── Flutter/Dart SSL (via BoringSSL native hook) ────────────────────
-    try {
-        var modules = Process.enumerateModules();
-        for (var i = 0; i < modules.length; i++) {
-            if (modules[i].name.indexOf('libflutter') !== -1) {
-                var exports = modules[i].enumerateExports();
-                for (var j = 0; j < exports.length; j++) {
-                    if (exports[j].name.indexOf('ssl_crypto_x509_session_verify_cert_chain') !== -1 ||
-                        exports[j].name.indexOf('session_verify_cert_chain') !== -1) {
-                        Interceptor.attach(exports[j].address, {
-                            onLeave: function (retval) { retval.replace(0x1); }
-                        });
-                        log('SSL', 'Flutter BoringSSL bypassed (' + exports[j].name + ')');
-                    }
+// Scan ARM64 code for BL instructions targeting a specific address.
+// ARM64 BL: 0x94000000 | imm26   where imm26 = (target - pc) >> 2 (signed)
+function scanAndNopBL(baseAddr, size, targetAddr) {
+    var count = 0;
+    var n = Math.floor(size / 4);
+    for (var i = 0; i < n; i++) {
+        var pc = baseAddr.add(i * 4);
+        try {
+            var instr = pc.readU32();
+            if ((instr & 0xFC000000) !== 0x94000000) continue;
+            var imm26 = instr & 0x03FFFFFF;
+            if (imm26 & 0x02000000) imm26 -= 0x04000000; // sign-extend
+            if (pc.add(imm26 * 4).equals(targetAddr)) {
+                if (writeNop(pc)) {
+                    count++;
+                    logBypass("[PATCH] NOP'd BL @ " + pc +
+                        " (+" + pc.sub(baseAddr).toString(16) + ")");
                 }
             }
-        }
-    } catch (e) { /* Flutter not present */ }
+        } catch (e) { break; }
+    }
+    return count;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  2. ROOT DETECTION BYPASS
+//  1. BINARY LOBOTOMY — Three-pass patch of libvosWrapperEx.so
+//
+//  Now callable from THREE hook points (mmap, call_constructors, dlopen).
+//  Idempotent: _lobotomized flag prevents double-patching.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function bypassRoot() {
+var _lobotomized     = false;
+var _crashPatched    = false;   // just the single RET at 0x66ff4
 
-    var rootPaths = [
-        '/system/app/Superuser.apk', '/system/app/Superuser', '/system/app/SuperSU',
-        '/system/xbin/su', '/system/bin/su', '/sbin/su', '/su/bin/su',
-        '/data/local/su', '/data/local/bin/su', '/data/local/xbin/su',
-        '/system/bin/.ext/.su', '/system/etc/.has_su_daemon',
-        '/system/usr/we-need-root/', '/cache/su',
-        '/data/su', '/dev/su', '/system/sd/xbin/su',
-        '/system/xbin/daemonsu', '/system/xbin/busybox',
-        '/system/bin/failsafe/su', '/vendor/bin/su',
-        '/su/bin', '/su',
-        '/data/local/tmp/frida-server', '/data/local/tmp/re.frida.server',
-        '/sbin/.magisk', '/sbin/.core', '/data/adb/magisk',
-        '/data/adb/magisk.img', '/data/adb/magisk.db',
-        '/cache/.disable_magisk', '/dev/.magisk.unblock',
-        '/init.magisk.rc',
-    ];
-
-    // Build a lookup set for O(1) matching
-    var rootPathSet = {};
-    for (var i = 0; i < rootPaths.length; i++) {
-        rootPathSet[rootPaths[i]] = true;
+function patchCrashSite(mod) {
+    if (_crashPatched) return true;
+    var addr = mod.base.add(CRASH_OFFSET);
+    logBypass("[CRASH-SITE] Writing RET at " + addr +
+        " (" + mod.name + " + 0x" + CRASH_OFFSET.toString(16) + ")");
+    if (writeRet(addr)) {
+        _crashPatched = true;
+        logBypass("[CRASH-SITE] SUCCESS — detection function killed");
+        return true;
     }
+    logError("[CRASH-SITE] FAILED to write RET at " + addr);
+    return false;
+}
 
-    var rootPackages = [
-        'com.topjohnwu.magisk', 'com.koushikdutta.superuser',
-        'com.noshufou.android.su', 'com.thirdparty.superuser',
-        'eu.chainfire.supersu', 'com.yellowes.su',
-        'com.devadvance.rootcloak', 'com.devadvance.rootcloakplus',
-        'de.robv.android.xposed.installer', 'com.saurik.substrate',
-        'com.zachspong.temprootremovejb', 'com.amphoras.hidemyroot',
-        'com.amphoras.hidemyrootadfree', 'com.formyhm.hiderootPremium',
-        'com.formyhm.hideroot', 'com.koushikdutta.rommanager',
-        'com.dimonvideo.luckypatcher', 'com.chelpus.lackypatch',
-        'com.ramdroid.appquarantine', 'me.phh.superuser',
-        'io.github.vvb2060.magisk',
-    ];
+function lobotomize(mod) {
+    if (_lobotomized) return;
 
-    var rootPackageSet = {};
-    for (var i = 0; i < rootPackages.length; i++) {
-        rootPackageSet[rootPackages[i]] = true;
-    }
+    var abortAddr = resolveExport("abort");
+    var exitAddr  = resolveExport("exit");
+    var _exitAddr = resolveExport("_exit");
 
-    function isRootPath(path) {
-        if (rootPathSet[path]) return true;
-        // Catch any path containing /su that isn't sugar/surf/suite/etc
-        if (path.indexOf('/su') !== -1) {
-            var after = path.substring(path.lastIndexOf('/su') + 3);
-            if (after === '' || after[0] === '/' || after[0] === '.') return true;
+    logBypass("=== BINARY LOBOTOMY === " + mod.name +
+        " base=" + mod.base + " size=" + mod.size);
+
+    // Pass 1: RET at crash site (may already be done by mmap/call_ctors hook)
+    patchCrashSite(mod);
+
+    // Pass 2: NOP BL→abort/exit in ±4KB neighborhood
+    var windowStart = Math.max(0, CRASH_OFFSET - SCAN_WINDOW);
+    var windowEnd   = Math.min(mod.size, CRASH_OFFSET + SCAN_WINDOW);
+    var windowBase  = mod.base.add(windowStart);
+    var windowSize  = windowEnd - windowStart;
+
+    var localCount = 0;
+    if (abortAddr) localCount += scanAndNopBL(windowBase, windowSize, abortAddr);
+    if (exitAddr)  localCount += scanAndNopBL(windowBase, windowSize, exitAddr);
+    if (_exitAddr) localCount += scanAndNopBL(windowBase, windowSize, _exitAddr);
+    logBypass("[PASS 2] NOP'd " + localCount + " BL→abort/exit in ±4KB zone");
+
+    // Pass 3: Full module sweep
+    var fullCount = 0;
+    if (abortAddr) fullCount += scanAndNopBL(mod.base, mod.size, abortAddr);
+    if (exitAddr)  fullCount += scanAndNopBL(mod.base, mod.size, exitAddr);
+    if (_exitAddr) fullCount += scanAndNopBL(mod.base, mod.size, _exitAddr);
+    logBypass("[PASS 3] NOP'd " + fullCount + " additional BL→abort/exit in full module");
+
+    _lobotomized = true;
+    logBypass("[LOBOTOMY] COMPLETE — " +
+        (1 + localCount + fullCount) + " instructions rewritten");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  2. PRE-EMPTIVE STRIKE — Three methods to patch before constructors
+//
+//  Method A: Hook linker's call_constructors (best — fires right before ctors)
+//  Method B: Hook mmap via fd tracking (fastest — fires at segment mapping)
+//  Method C: dlopen onLeave (safety net — fires after ctors, too late alone)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var _targetFds = {};   // fd (int) → true, for tracked fds of target .so
+
+// ── Method A: Hook linker's call_constructors ────────────────────────────────
+
+function hookCallConstructors() {
+    var linker = Process.findModuleByName("linker64")
+              || Process.findModuleByName("linker");
+    if (!linker) { logError("[PRE-A] Linker module not found"); return false; }
+
+    var ctorAddr = null;
+    var ctorName = "";
+
+    // Search exports for call_constructors
+    try {
+        var exports = linker.enumerateExports();
+        for (var i = 0; i < exports.length; i++) {
+            var n = exports[i].name;
+            if (n.indexOf("call_constructor") !== -1 && exports[i].type === "function") {
+                ctorAddr = exports[i].address;
+                ctorName = n;
+                break;
+            }
         }
+    } catch (e) { }
+
+    // Fallback: search all symbols (includes non-exported)
+    if (!ctorAddr) {
+        try {
+            var symbols = linker.enumerateSymbols();
+            for (var i = 0; i < symbols.length; i++) {
+                var n = symbols[i].name;
+                if (n.indexOf("call_constructor") !== -1
+                    && symbols[i].address && !symbols[i].address.isNull()) {
+                    ctorAddr = symbols[i].address;
+                    ctorName = n;
+                    break;
+                }
+            }
+        } catch (e) { }
+    }
+
+    if (!ctorAddr) {
+        logError("[PRE-A] call_constructors not found in " + linker.name);
+        // Log what IS available for debugging
+        try {
+            var exports = linker.enumerateExports();
+            var interesting = [];
+            for (var i = 0; i < exports.length; i++) {
+                var n = exports[i].name;
+                if (n.indexOf("soinfo") !== -1 || n.indexOf("constructor") !== -1
+                    || n.indexOf("init_func") !== -1 || n.indexOf("DT_INIT") !== -1) {
+                    interesting.push(n);
+                }
+            }
+            if (interesting.length > 0) {
+                logInfo("[PRE-A] Possibly related linker symbols:");
+                for (var i = 0; i < Math.min(interesting.length, 10); i++) {
+                    logInfo("  " + interesting[i]);
+                }
+            }
+        } catch (e) { }
         return false;
     }
 
-    // ── java.io.File — hide root paths ──────────────────────────────────
-    try {
-        var File = Java.use('java.io.File');
-        File.exists.implementation = function () {
-            var path = this.getAbsolutePath();
-            if (isRootPath(path)) {
-                log('ROOT', 'File.exists("' + path + '") -> false');
-                return false;
+    logBypass("[PRE-A] Found: " + ctorName + " @ " + ctorAddr);
+
+    Interceptor.attach(ctorAddr, {
+        onEnter: function () {
+            if (_crashPatched) return;
+            // call_constructors fires for every .so. Check if our target is mapped.
+            var mod = findVKeyModule();
+            if (mod) {
+                logBypass("[PRE-A] TARGET IN MEMORY — patching before constructors!");
+                patchCrashSite(mod);
+                // Full lobotomy too — we're still before this module's ctors
+                if (!_lobotomized) lobotomize(mod);
             }
-            return this.exists();
-        };
-        log('ROOT', 'File.exists hooked (' + rootPaths.length + ' paths hidden)');
-    } catch (e) {
-        log('ERROR', 'File.exists: ' + e);
-    }
-
-    try {
-        var File = Java.use('java.io.File');
-        File.isDirectory.implementation = function () {
-            var path = this.getAbsolutePath();
-            if (rootPathSet[path]) return false;
-            return this.isDirectory();
-        };
-    } catch (e) { /* not needed */ }
-
-    // ── PackageManager — hide root packages ─────────────────────────────
-    try {
-        var PM = Java.use('android.app.ApplicationPackageManager');
-        PM.getPackageInfo.overload('java.lang.String', 'int').implementation = function (pkg, flags) {
-            if (rootPackageSet[pkg]) {
-                log('ROOT', 'getPackageInfo("' + pkg + '") -> NameNotFoundException');
-                throw Java.use('android.content.pm.PackageManager$NameNotFoundException').$new(pkg);
-            }
-            return this.getPackageInfo(pkg, flags);
-        };
-        log('ROOT', 'PackageManager.getPackageInfo hooked (' + rootPackages.length + ' packages hidden)');
-    } catch (e) {
-        log('ERROR', 'PackageManager: ' + e);
-    }
-
-    // ── PackageManager.getInstalledPackages — filter root apps ──────────
-    try {
-        var PM = Java.use('android.app.ApplicationPackageManager');
-        PM.getInstalledPackages.overload('int').implementation = function (flags) {
-            var pkgs = this.getInstalledPackages(flags);
-            var it = pkgs.iterator();
-            while (it.hasNext()) {
-                var info = Java.cast(it.next(), Java.use('android.content.pm.PackageInfo'));
-                if (rootPackageSet[info.packageName.value]) {
-                    it.remove();
-                }
-            }
-            return pkgs;
-        };
-        log('ROOT', 'PackageManager.getInstalledPackages filtered');
-    } catch (e) { /* not needed */ }
-
-    // ── PackageManager.getInstalledApplications — filter root apps ──────
-    try {
-        var PM = Java.use('android.app.ApplicationPackageManager');
-        PM.getInstalledApplications.overload('int').implementation = function (flags) {
-            var apps = this.getInstalledApplications(flags);
-            var it = apps.iterator();
-            while (it.hasNext()) {
-                var info = Java.cast(it.next(), Java.use('android.content.pm.ApplicationInfo'));
-                if (rootPackageSet[info.packageName.value]) {
-                    it.remove();
-                }
-            }
-            return apps;
-        };
-        log('ROOT', 'PackageManager.getInstalledApplications filtered');
-    } catch (e) { /* not needed */ }
-
-    // ── Runtime.exec — block root commands ──────────────────────────────
-    try {
-        var Runtime = Java.use('java.lang.Runtime');
-
-        function isRootCmd(cmd) {
-            // Only block exact root-probing commands, not legitimate usage
-            var blocked = ['which su', '/system/xbin/which su', '/system/bin/which su'];
-            for (var i = 0; i < blocked.length; i++) {
-                if (cmd.indexOf(blocked[i]) !== -1) return true;
-            }
-            // Block if the entire command is just 'su' (not 'sudo', 'sum', etc)
-            var trimmed = cmd.trim();
-            if (trimmed === 'su' || trimmed === 'su -' || trimmed.match(/^su\s+/)) return true;
-            return false;
         }
+    });
 
-        Runtime.exec.overload('[Ljava.lang.String;').implementation = function (cmds) {
-            var cmd = cmds.join(' ');
-            if (isRootCmd(cmd)) {
-                log('ROOT', 'Runtime.exec("' + cmd + '") -> IOException');
-                throw Java.use('java.io.IOException').$new('Cannot run program');
+    _hookCount++;
+    logBypass("[PRE-A] call_constructors hook INSTALLED");
+    return true;
+}
+
+// ── Method B: Hook mmap to catch the instant .text is mapped ────────────────
+
+function hookMmapMonitor() {
+    // The linker has its own mmap — try to find it
+    var linker = Process.findModuleByName("linker64")
+              || Process.findModuleByName("linker");
+    var mmapAddr = null;
+    var mmapSource = "";
+
+    if (linker) {
+        try {
+            var exports = linker.enumerateExports();
+            for (var i = 0; i < exports.length; i++) {
+                var n = exports[i].name;
+                // Look for mmap variants in the linker
+                if ((n === "__dl_mmap" || n === "__dl_mmap64"
+                     || n.indexOf("mmap") !== -1)
+                    && exports[i].type === "function"
+                    && n.indexOf("munmap") === -1) {
+                    mmapAddr = exports[i].address;
+                    mmapSource = "linker:" + n;
+                    break;
+                }
             }
-            return this.exec(cmds);
-        };
-        Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
-            if (isRootCmd(cmd)) {
-                log('ROOT', 'Runtime.exec("' + cmd + '") -> IOException');
-                throw Java.use('java.io.IOException').$new('Cannot run program');
-            }
-            return this.exec(cmd);
-        };
-        Runtime.exec.overload('java.lang.String', '[Ljava.lang.String;', 'java.io.File').implementation = function (cmd, env, dir) {
-            if (isRootCmd(cmd)) {
-                log('ROOT', 'Runtime.exec("' + cmd + '") -> IOException');
-                throw Java.use('java.io.IOException').$new('Cannot run program');
-            }
-            return this.exec(cmd, env, dir);
-        };
-        log('ROOT', 'Runtime.exec hooked (blocking root commands)');
-    } catch (e) {
-        log('ERROR', 'Runtime.exec: ' + e);
+        } catch (e) { }
     }
 
-    // ── ProcessBuilder — block root commands ────────────────────────────
-    try {
-        var ProcessBuilder = Java.use('java.lang.ProcessBuilder');
-        ProcessBuilder.start.implementation = function () {
-            var cmds = this.command();
-            var first = cmds.size() > 0 ? String(cmds.get(0)) : '';
-            if (first.endsWith('/su') || first === 'su') {
-                log('ROOT', 'ProcessBuilder("' + first + '") -> IOException');
-                throw Java.use('java.io.IOException').$new('Cannot run program');
+    // Fallback: libc mmap (may miss linker-internal mmap calls)
+    if (!mmapAddr) {
+        mmapAddr = Module.findExportByName("libc.so", "mmap64")
+                || Module.findExportByName("libc.so", "mmap");
+        mmapSource = "libc:mmap";
+    }
+
+    if (!mmapAddr) {
+        logError("[PRE-B] No mmap found");
+        return false;
+    }
+
+    // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+    Interceptor.attach(mmapAddr, {
+        onEnter: function (args) {
+            this._fd     = args[4].toInt32();
+            this._len    = args[1].toUInt32();
+            this._offset = args[5].toUInt32();
+        },
+        onLeave: function (retval) {
+            if (_crashPatched) return;
+
+            // Quick rejects
+            if (retval.isNull()) return;
+            var retInt = retval.toInt32();
+            if (retInt === -1 || retInt === 0) return;  // MAP_FAILED or NULL
+            if (this._fd < 0 || !_targetFds[this._fd]) return;
+
+            // Check if CRASH_OFFSET falls in [file_offset, file_offset + length)
+            var fOff = this._offset;
+            var fLen = this._len;
+            if (CRASH_OFFSET >= fOff && CRASH_OFFSET < fOff + fLen) {
+                var crashMem = retval.add(CRASH_OFFSET - fOff);
+                logBypass("[PRE-B] mmap caught target .text — crash site at " + crashMem);
+
+                if (writeRet(crashMem)) {
+                    _crashPatched = true;
+                    logBypass("[PRE-B] SUCCESS — RET written via mmap hook (BEFORE constructors!)");
+                } else {
+                    logError("[PRE-B] mmap patch failed — relying on Method A/C");
+                }
             }
-            return this.start();
-        };
-        log('ROOT', 'ProcessBuilder.start hooked');
-    } catch (e) { /* not needed */ }
+        }
+    });
 
-    // ── Build.TAGS — hide test-keys ─────────────────────────────────────
-    try {
-        var Build = Java.use('android.os.Build');
-        Build.TAGS.value = 'release-keys';
-        log('ROOT', 'Build.TAGS set to "release-keys"');
-    } catch (e) { /* not needed */ }
+    _hookCount++;
+    logBypass("[PRE-B] mmap monitor via " + mmapSource + " INSTALLED");
+    return true;
+}
 
-    // ── System properties — hide root indicators ────────────────────────
-    try {
-        var SystemProperties = Java.use('android.os.SystemProperties');
-        var propOverrides = {
-            'ro.build.tags': 'release-keys',
-            'ro.debuggable': '0',
-            'service.adb.root': '0',
-            'ro.secure': '1'
-        };
-        SystemProperties.get.overload('java.lang.String').implementation = function (key) {
-            if (propOverrides[key] !== undefined) return propOverrides[key];
-            return this.get(key);
-        };
-        SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
-            if (propOverrides[key] !== undefined) return propOverrides[key];
-            return this.get(key, def);
-        };
-        log('ROOT', 'SystemProperties.get hooked');
-    } catch (e) { /* not needed */ }
+// ── fd tracking: openat hook extension (shared with MemFD Phantom) ──────────
+// Integrated into the openat hook in §4 — see hookFileSystem().
 
-    // ── Settings.Secure — hide developer options ────────────────────────
-    try {
-        var Secure = Java.use('android.provider.Settings$Secure');
-        Secure.getInt.overload('android.content.ContentResolver', 'java.lang.String', 'int').implementation = function (cr, name, def) {
-            if (name === 'adb_enabled' || name === 'development_settings_enabled') return 0;
-            return this.getInt(cr, name, def);
-        };
-        log('ROOT', 'Settings.Secure.getInt hooked');
-    } catch (e) { /* not needed */ }
+// ── Method C: dlopen safety net ─────────────────────────────────────────────
 
-    // ── Native: fopen — hide root files at OS level ─────────────────────
-    try {
-        var fopen = Module.findExportByName('libc.so', 'fopen');
-        if (fopen) {
-            Interceptor.attach(fopen, {
+function hookLinker() {
+    ["dlopen", "android_dlopen_ext"].forEach(function (sym) {
+        var p = resolveExport(sym);
+        if (!p) return;
+        try {
+            Interceptor.attach(p, {
                 onEnter: function (args) {
-                    this.block = false;
-                    try {
-                        var path = args[0].readUtf8String();
-                        if (path && rootPathSet[path]) {
-                            this.block = true;
-                            this.path = path;
-                        }
-                    } catch (e) { /* can't read path, skip */ }
+                    this.lib = null;
+                    this.isVKey = false;
+                    this.raspLib = null;
+                    try { this.lib = args[0].isNull() ? null : args[0].readUtf8String(); }
+                    catch (e) { return; }
+                    if (!this.lib) return;
+                    logInfo(sym + "() -> " + this.lib);
+
+                    if (isVKeyPath(this.lib)) this.isVKey = true;
+                    if (containsAny(this.lib, RASP_LIBS)) this.raspLib = this.lib;
                 },
                 onLeave: function (retval) {
-                    if (this.block) {
-                        log('ROOT', 'fopen("' + this.path + '") -> NULL');
-                        retval.replace(ptr(0));
+                    if (!this.lib || retval.isNull()) return;
+
+                    // Refresh phantom maps after any /data/ library loads
+                    if (this.lib.indexOf("/data/") !== -1) {
+                        try { refreshBuffers(); } catch (e) { }
+                    }
+
+                    // ── METHOD C: LOBOTOMY TRIGGER ────────────────────────
+                    if (this.isVKey) {
+                        if (!_crashPatched) {
+                            logError("[PRE-C] Methods A & B missed! Patching in dlopen onLeave (LATE!)");
+                        } else {
+                            logBypass("[PRE-C] Crash site was already patched BEFORE constructors");
+                        }
+
+                        if (!_lobotomized) {
+                            var mod = findVKeyModule();
+                            if (mod) {
+                                lobotomize(mod);
+                            } else {
+                                // Try by raw name
+                                var parts = this.lib.split("/");
+                                var modName = parts[parts.length - 1];
+                                var m2 = Process.findModuleByName(modName);
+                                if (m2) lobotomize(m2);
+                            }
+                        }
+                    }
+
+                    // Block JNI_OnLoad for RASP libs
+                    if (this.raspLib) {
+                        try {
+                            var parts = this.raspLib.split("/");
+                            var mn = parts[parts.length - 1];
+                            var mod = Process.findModuleByName(mn);
+                            if (mod) {
+                                var jni = mod.findExportByName("JNI_OnLoad");
+                                if (jni && !jni.isNull()) {
+                                    Interceptor.replace(jni, new NativeCallback(function () {
+                                        logBypass("JNI_OnLoad blocked: " + mn);
+                                        return 0x00010006;
+                                    }, "int", ["pointer", "pointer"]));
+                                }
+                            }
+                        } catch (e) { }
                     }
                 }
             });
-            log('ROOT', 'Native fopen hooked');
+            _hookCount++;
+        } catch (e) { }
+    });
+
+    safeAttach("dlsym", {
+        onEnter: function (args) {
+            this.block = false;
+            try {
+                var n = args[1].readUtf8String();
+                if (n && containsAny(n, ["frida", "gum_", "gum-", "interceptor", "gadget",
+                    "frida_agent", "frida_gadget", "gumjs"])) {
+                    this.block = true;
+                }
+            } catch (e) { }
+        },
+        onLeave: function (r) { if (this.block) r.replace(ptr(0)); }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  3. NATIVE FUNCTION SETUP — memfd / pipe / errno
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var _nativeClose = null;
+var _nativeWrite = null;
+var _nativeLseek = null;
+var _nativePipe  = null;
+var _errnoFn = null;
+var _memfdAvailable = false;
+var _NR_memfd_create = 0;
+var _memfdFn = null;
+
+function initNativeFunctions() {
+    var pClose   = resolveExport("close");
+    var pWrite   = resolveExport("write");
+    var pLseek   = resolveExport("lseek");
+    var pPipe    = resolveExport("pipe");
+    var pSyscall = resolveExport("syscall");
+    var pErrno   = resolveExport("__errno") || resolveExport("__errno_location");
+
+    if (pClose)  _nativeClose = new NativeFunction(pClose, "int", ["int"]);
+    if (pWrite)  _nativeWrite = new NativeFunction(pWrite, "long", ["int", "pointer", "long"]);
+    if (pLseek)  _nativeLseek = new NativeFunction(pLseek, "long", ["int", "long", "int"]);
+    if (pPipe)   _nativePipe  = new NativeFunction(pPipe, "int", ["pointer"]);
+    if (pErrno)  _errnoFn     = new NativeFunction(pErrno, "pointer", []);
+
+    if (Process.arch === "arm64")     _NR_memfd_create = 279;
+    else if (Process.arch === "arm")  _NR_memfd_create = 385;
+    else if (Process.arch === "x64")  _NR_memfd_create = 319;
+    else if (Process.arch === "ia32") _NR_memfd_create = 356;
+
+    if (pSyscall && _NR_memfd_create) {
+        try {
+            _memfdFn = new NativeFunction(pSyscall, "int", ["int", "pointer", "uint"]);
+            var testName = Memory.allocUtf8String("");
+            var testFd = _memfdFn(_NR_memfd_create, testName, 0);
+            if (testFd >= 0) {
+                _nativeClose(testFd);
+                _memfdAvailable = true;
+                logBypass("memfd_create OK (nr=" + _NR_memfd_create + ")");
+            } else {
+                logInfo("memfd_create returned " + testFd + " — pipe fallback");
+            }
+        } catch (e) {
+            logInfo("memfd_create test failed — pipe fallback");
         }
-    } catch (e) {
-        log('ERROR', 'fopen: ' + e);
+    }
+    if (!_memfdAvailable && _nativePipe) logBypass("Pipe fallback ready");
+}
+
+function setErrno(val) {
+    if (_errnoFn) { try { _errnoFn().writeS32(val); } catch (e) { } }
+}
+
+function createFdWithContent(content) {
+    if (!content || content.length === 0) return -1;
+    var buf = Memory.allocUtf8String(content);
+    var len = content.length;
+
+    if (_memfdAvailable && _memfdFn && _nativeWrite && _nativeLseek) {
+        var name = Memory.allocUtf8String("");
+        var fd = _memfdFn(_NR_memfd_create, name, 0);
+        if (fd >= 0) {
+            _nativeWrite(fd, buf, len);
+            _nativeLseek(fd, 0, 0);
+            return fd;
+        }
+    }
+    if (_nativePipe && _nativeWrite && _nativeClose) {
+        var fds = Memory.alloc(8);
+        if (_nativePipe(fds) === 0) {
+            var r = fds.readS32();
+            var w = fds.add(4).readS32();
+            _nativeWrite(w, buf, len);
+            _nativeClose(w);
+            return r;
+        }
+    }
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  4. MEMFD PHANTOM + FILE SYSTEM CAMOUFLAGE
+//     Combined: openat also tracks target .so fds for the pre-emptive strike.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var _cleanMaps = "";
+var _cleanStatus = "";
+var _mapsReady = false;
+var _statusReady = false;
+var _isRefreshing = false;
+
+function isProcMaps(path) {
+    var m = path.match(/\/proc\/(\d+|self)(\/task\/\d+)?\/maps$/);
+    if (!m) return false;
+    return m[1] === "self" || parseInt(m[1]) === _myPid;
+}
+
+function isProcStatus(path) {
+    var m = path.match(/\/proc\/(\d+|self)(\/task\/\d+)?\/status$/);
+    if (!m) return false;
+    return m[1] === "self" || parseInt(m[1]) === _myPid;
+}
+
+function refreshBuffers() {
+    _isRefreshing = true;
+    try {
+        var raw = File.readAllText("/proc/self/maps");
+        var lines = raw.split("\n");
+        var clean = [];
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].length > 0 && containsAny(lines[i], MAPS_FILTER)) continue;
+            clean.push(lines[i]);
+        }
+        _cleanMaps = clean.join("\n");
+        _mapsReady = true;
+    } catch (e) { }
+    try {
+        var raw = File.readAllText("/proc/self/status");
+        _cleanStatus = raw.replace(/TracerPid:\s*\d+/, "TracerPid:\t0");
+        _statusReady = true;
+    } catch (e) { }
+    _isRefreshing = false;
+}
+
+function initPhantom() {
+    refreshBuffers();
+    logBypass("MemFD Phantom: maps=" + _cleanMaps.length + "B status=" + _cleanStatus.length + "B");
+    setInterval(function () { try { refreshBuffers(); } catch (e) { } }, 5000);
+}
+
+function hookFileSystem() {
+
+    // Shared handler for open/openat onEnter
+    function handleOpenEnter(path) {
+        this.block = false;
+        this.redirect = 0;
+        this.trackFd = false;
+
+        if (!path) return;
+
+        // Pre-emptive strike: track target .so fds
+        if (isVKeyPath(path)) {
+            this.trackFd = true;
+        }
+
+        // MemFD phantom redirects
+        if (_isRefreshing) return;
+        if (path.indexOf("/proc/") !== -1) {
+            if (isProcMaps(path))   { this.redirect = 1; return; }
+            if (isProcStatus(path)) { this.redirect = 2; return; }
+            return;
+        }
+
+        // Block root/frida file access
+        if (containsAny(path, ROOT_FRAGMENTS) || containsAny(path, FRIDA_FRAGMENTS))
+            this.block = true;
     }
 
-    // ── Native: access — hide root files ────────────────────────────────
-    try {
-        var access_func = Module.findExportByName('libc.so', 'access');
-        if (access_func) {
-            Interceptor.attach(access_func, {
-                onEnter: function (args) {
-                    this.block = false;
-                    try {
-                        var path = args[0].readUtf8String();
-                        if (path && rootPathSet[path]) {
-                            this.block = true;
-                        }
-                    } catch (e) { /* skip */ }
-                },
-                onLeave: function (retval) {
-                    if (this.block) retval.replace(-1);
-                }
-            });
-            log('ROOT', 'Native access() hooked');
-        }
-    } catch (e) { /* not critical */ }
+    function handleOpenLeave(retval) {
+        var fd = retval.toInt32();
 
-    // ── Native: stat / lstat — hide root files ──────────────────────────
-    try {
-        ['stat', 'lstat', '__xstat', 'stat64'].forEach(function (fn) {
-            var addr = Module.findExportByName('libc.so', fn);
-            if (addr) {
-                Interceptor.attach(addr, {
+        // Track target .so fd for mmap monitoring
+        if (this.trackFd && fd >= 0) {
+            _targetFds[fd] = true;
+            logBypass("[FD-TRACK] Target .so opened, fd=" + fd);
+        }
+
+        if (this.block) { retval.replace(-1); setErrno(2); return; }
+        if (this.redirect > 0 && fd >= 0) {
+            var c = (this.redirect === 1) ? _cleanMaps : _cleanStatus;
+            var r = (this.redirect === 1) ? _mapsReady : _statusReady;
+            if (r && c.length > 0) {
+                var newFd = createFdWithContent(c);
+                if (newFd >= 0) {
+                    if (_nativeClose) _nativeClose(fd);
+                    retval.replace(newFd);
+                }
+            }
+        }
+    }
+
+    // ── open() ───────────────────────────────────────────────────────────
+    safeAttach("open", {
+        onEnter: function (args) {
+            try { this._path = args[0].readUtf8String(); } catch (e) { this._path = null; }
+            handleOpenEnter.call(this, this._path);
+        },
+        onLeave: function (retval) { handleOpenLeave.call(this, retval); }
+    });
+
+    // ── openat() ─────────────────────────────────────────────────────────
+    safeAttach("openat", {
+        onEnter: function (args) {
+            try { this._path = args[1].readUtf8String(); } catch (e) { this._path = null; }
+            handleOpenEnter.call(this, this._path);
+        },
+        onLeave: function (retval) { handleOpenLeave.call(this, retval); }
+    });
+
+    // ── faccessat ────────────────────────────────────────────────────────
+    safeAttach("faccessat", {
+        onEnter: function (args) {
+            this.block = false;
+            try {
+                var p = args[1].readUtf8String();
+                if (p && (containsAny(p, ROOT_FRAGMENTS) || containsAny(p, FRIDA_FRAGMENTS)))
+                    this.block = true;
+            } catch (e) { }
+        },
+        onLeave: function (retval) {
+            if (this.block) { retval.replace(-1); setErrno(2); }
+        }
+    });
+
+    // ── stat / lstat variants ────────────────────────────────────────────
+    var sc = 0;
+    ["stat", "lstat", "stat64", "lstat64", "__stat64_time64", "__lstat64_time64"]
+        .forEach(function (sym) {
+            var p = resolveExport(sym);
+            if (!p) return;
+            try {
+                Interceptor.attach(p, {
                     onEnter: function (args) {
                         this.block = false;
                         try {
                             var path = args[0].readUtf8String();
-                            if (path && rootPathSet[path]) this.block = true;
-                        } catch (e) { /* skip */ }
+                            if (path && containsAny(path, ROOT_FRAGMENTS)) this.block = true;
+                        } catch (e) { }
                     },
                     onLeave: function (retval) {
-                        if (this.block) retval.replace(-1);
+                        if (this.block) { retval.replace(-1); setErrno(2); }
                     }
                 });
-            }
+                sc++;
+            } catch (e) { }
         });
-        log('ROOT', 'Native stat/lstat hooked');
-    } catch (e) { /* not critical */ }
+    logBypass("stat/lstat: " + sc + " variants hooked");
 
-    // ── RootBeer library ────────────────────────────────────────────────
-    try {
-        var RootBeer = Java.use('com.scottyab.rootbeer.RootBeer');
-        ['isRooted', 'isRootedWithoutBusyBoxCheck', 'detectRootManagementApps',
-         'detectPotentiallyDangerousApps', 'detectTestKeys', 'checkForBinary',
-         'checkForDangerousProps', 'checkForRWPaths', 'detectRootCloakingApps',
-         'checkSuExists', 'checkForRootNative', 'checkForMagiskBinary'].forEach(function (m) {
+    // ── access ───────────────────────────────────────────────────────────
+    safeAttach("access", {
+        onEnter: function (args) {
+            this.block = false;
             try {
-                RootBeer[m].overloads.forEach(function (o) { o.implementation = function () { return false; }; });
-            } catch (e) { /* method not found */ }
-        });
-        log('ROOT', 'RootBeer library fully bypassed');
-    } catch (e) { /* not present */ }
+                var p = args[0].readUtf8String();
+                if (p && (containsAny(p, ROOT_FRAGMENTS) || containsAny(p, FRIDA_FRAGMENTS)))
+                    this.block = true;
+            } catch (e) { }
+        },
+        onLeave: function (retval) {
+            if (this.block) { retval.replace(-1); setErrno(2); }
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  3. RUNTIME TAMPERING / ANTI-FRIDA / ANTI-DEBUG BYPASS
+//  5. STRING NEUTRALIZER — strstr / strcmp / strncmp
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function bypassTampering() {
+function hookStringOps() {
+    var POISON = [
+        "frida", "xposed", "substrate", "magisk", "supersu",
+        "gum-js", "linjector", "re.frida", "gadget",
+        "frida-server", "frida-agent", "frida-gadget", "REJECT",
+    ];
 
-    // ── Debug.isDebuggerConnected / waitingForDebugger ───────────────────
-    try {
-        var Debug = Java.use('android.os.Debug');
-        Debug.isDebuggerConnected.implementation = function () { return false; };
-        Debug.waitingForDebugger.implementation = function () { return false; };
-        log('TAMPER', 'Debug.isDebuggerConnected / waitingForDebugger -> false');
-    } catch (e) { /* not needed */ }
-
-    // ── Anti-Frida: /proc/self/maps scanning ────────────────────────────
-    // Only filter lines from FileReader pointing to /proc/ paths
-    try {
-        var FileReader = Java.use('java.io.FileReader');
-        var BufferedReader = Java.use('java.io.BufferedReader');
-        var InputStreamReader = Java.use('java.io.InputStreamReader');
-
-        // Track which BufferedReaders are wrapping /proc/ files
-        var procReaders = new WeakSet ? new WeakSet() : null;
-
-        // Hook FileReader to detect /proc/self/maps opens
-        FileReader.$init.overload('java.lang.String').implementation = function (path) {
-            this.$init(path);
-            if (path && (path.indexOf('/proc/self/maps') !== -1 ||
-                         path.indexOf('/proc/self/status') !== -1 ||
-                         path.indexOf('/proc/self/task') !== -1)) {
-                this._isProcFile = true;
-            }
-        };
-
-        // Hook BufferedReader.readLine — only filter for proc file readers
-        var originalReadLine = BufferedReader.readLine.overload();
-        BufferedReader.readLine.overload().implementation = function () {
-            var line = originalReadLine.call(this);
-
-            // Check if this reader wraps a proc file
-            // We check the underlying reader by inspecting the line content
-            if (line !== null) {
-                var lineStr = String(line);
-                // Only filter lines that look like /proc/maps entries containing Frida
-                if ((lineStr.indexOf('frida') !== -1 ||
-                     lineStr.indexOf('gadget') !== -1 ||
-                     lineStr.indexOf('gum-js-loop') !== -1 ||
-                     lineStr.indexOf('linjector') !== -1) &&
-                    (lineStr.indexOf('.so') !== -1 || lineStr.indexOf('deleted') !== -1 ||
-                     lineStr.indexOf('/tmp/') !== -1 || lineStr.indexOf('r-xp') !== -1 ||
-                     lineStr.indexOf('r--p') !== -1)) {
-                    // This is a /proc/maps line mentioning Frida — skip it
-                    log('TAMPER', 'Filtered Frida from /proc/maps line');
-                    return originalReadLine.call(this);
-                }
-            }
-            return line;
-        };
-        log('TAMPER', 'BufferedReader.readLine hooked (targeted /proc/maps filtering)');
-    } catch (e) {
-        log('ERROR', 'BufferedReader: ' + e);
-    }
-
-    // ── Anti-Frida: Port detection (27042, 27043) ───────────────────────
-    try {
-        var Socket = Java.use('java.net.Socket');
-        var InetSocketAddress = Java.use('java.net.InetSocketAddress');
-
-        Socket.connect.overload('java.net.SocketAddress', 'int').implementation = function (addr, timeout) {
+    safeAttach("strstr", {
+        onEnter: function (a) {
+            this.block = false;
+            try { var n = a[1].readUtf8String(); if (n && containsAny(n, POISON)) this.block = true; } catch (e) { }
+        },
+        onLeave: function (r) { if (this.block) r.replace(ptr(0)); }
+    });
+    safeAttach("strcmp", {
+        onEnter: function (a) {
+            this.block = false;
             try {
-                var sa = Java.cast(addr, InetSocketAddress);
-                var port = sa.getPort();
-                if (port === 27042 || port === 27043) {
-                    log('TAMPER', 'Socket.connect to Frida port ' + port + ' -> blocked');
-                    throw Java.use('java.net.ConnectException').$new('Connection refused');
-                }
-            } catch (castErr) {
-                if (String(castErr).indexOf('ConnectException') !== -1) throw castErr;
-                /* cast failed, let it through */
-            }
-            return this.connect(addr, timeout);
-        };
-        Socket.connect.overload('java.net.SocketAddress').implementation = function (addr) {
+                var s1 = a[0].readUtf8String(), s2 = a[1].readUtf8String();
+                if ((s1 && containsAny(s1, POISON)) || (s2 && containsAny(s2, POISON))) this.block = true;
+            } catch (e) { }
+        },
+        onLeave: function (r) { if (this.block) r.replace(1); }
+    });
+    safeAttach("strncmp", {
+        onEnter: function (a) {
+            this.block = false;
             try {
-                var sa = Java.cast(addr, InetSocketAddress);
-                var port = sa.getPort();
-                if (port === 27042 || port === 27043) {
-                    log('TAMPER', 'Socket.connect to Frida port ' + port + ' -> blocked');
-                    throw Java.use('java.net.ConnectException').$new('Connection refused');
-                }
-            } catch (castErr) {
-                if (String(castErr).indexOf('ConnectException') !== -1) throw castErr;
-            }
-            return this.connect(addr);
-        };
-        log('TAMPER', 'Socket.connect hooked (blocking Frida port 27042/27043)');
-    } catch (e) {
-        log('ERROR', 'Socket: ' + e);
-    }
+                var s1 = a[0].readUtf8String(), s2 = a[1].readUtf8String();
+                if ((s1 && containsAny(s1, POISON)) || (s2 && containsAny(s2, POISON))) this.block = true;
+            } catch (e) { }
+        },
+        onLeave: function (r) { if (this.block) r.replace(1); }
+    });
+}
 
-    // ── Anti-Frida: Native strstr — hide "frida" from string searches ───
+// ═══════════════════════════════════════════════════════════════════════════════
+//  6. SUICIDE PREVENTION — Auto-NOP Edition
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var _abortTraced = false;
+var _abortCount = 0;
+var _exitCount = 0;
+
+function nopCallSite(retAddr) {
+    var bl = retAddr.sub(4);
     try {
-        var strstr = Module.findExportByName('libc.so', 'strstr');
-        if (strstr) {
-            var fridaStrings = ['frida', 'LIBFRIDA', 'gadget', 'gum-js-loop', 'gmain', 'linjector'];
-            Interceptor.attach(strstr, {
-                onEnter: function (args) {
-                    this.block = false;
+        var instr = bl.readU32();
+        if ((instr & 0xFC000000) === 0x94000000) {
+            if (writeNop(bl)) {
+                var mod = Process.findModuleByAddress(bl);
+                var info = mod ? (mod.name + "+0x" + bl.sub(mod.base).toString(16)) : bl.toString();
+                logBypass("[AUTO-NOP] Patched call site: " + info);
+                return true;
+            }
+        }
+    } catch (e) { }
+    return false;
+}
+
+function hookSuicidePrevention() {
+
+    // ── ptrace ───────────────────────────────────────────────────────────
+    safeAttach("ptrace", {
+        onEnter: function () { },
+        onLeave: function (r) { r.replace(0); }
+    });
+
+    // ── abort() — backtrace + auto-NOP ───────────────────────────────────
+    var pAbort = resolveExport("abort");
+    if (pAbort) {
+        try {
+            Interceptor.replace(pAbort, new NativeCallback(function () {
+                _abortCount++;
+                if (!_abortTraced) {
+                    _abortTraced = true;
+                    logBypass("=== abort() HIT #1 — Native backtrace ===");
                     try {
-                        var needle = args[1].readUtf8String();
-                        if (needle) {
-                            for (var i = 0; i < fridaStrings.length; i++) {
-                                if (needle.indexOf(fridaStrings[i]) !== -1) {
-                                    this.block = true;
-                                    break;
-                                }
+                        var bt = Thread.backtrace(this.context, Backtracer.ACCURATE);
+                        for (var i = 0; i < bt.length; i++) {
+                            logBypass("  #" + i + "  " + DebugSymbol.fromAddress(bt[i]));
+                        }
+                        for (var i = 0; i < bt.length; i++) {
+                            var mod = Process.findModuleByAddress(bt[i]);
+                            if (mod && mod.path.indexOf("/data/app/") !== -1) {
+                                nopCallSite(bt[i]);
                             }
                         }
-                    } catch (e) { /* can't read, skip */ }
-                },
-                onLeave: function (retval) {
-                    if (this.block) retval.replace(ptr(0));
+                    } catch (e) { logError("backtrace: " + e); }
+                    logBypass("=== end backtrace ===");
                 }
-            });
-            log('TAMPER', 'Native strstr hooked (hiding Frida strings)');
-        }
-    } catch (e) { /* not critical */ }
-
-    // ── Anti-ptrace ─────────────────────────────────────────────────────
-    try {
-        var ptrace = Module.findExportByName(null, 'ptrace');
-        if (ptrace) {
-            Interceptor.attach(ptrace, {
-                onEnter: function (args) {
-                    this.bypass = (args[0].toInt32() === 0); // PTRACE_TRACEME
-                },
-                onLeave: function (retval) {
-                    if (this.bypass) {
-                        log('TAMPER', 'ptrace(PTRACE_TRACEME) -> 0');
-                        retval.replace(0);
-                    }
-                }
-            });
-            log('TAMPER', 'ptrace hooked (anti-debug bypass)');
-        }
-    } catch (e) { /* not critical */ }
-
-    // ── System.exit — prevent app from killing itself ───────────────────
-    try {
-        var System = Java.use('java.lang.System');
-        System.exit.implementation = function (code) {
-            log('TAMPER', 'System.exit(' + code + ') -> blocked');
-        };
-        log('TAMPER', 'System.exit blocked');
-    } catch (e) {
-        log('ERROR', 'System.exit: ' + e);
+                if (_abortCount <= 3)
+                    logBypass("abort() SWALLOWED (#" + _abortCount + ")");
+            }, "void", []));
+            _hookCount++;
+            logBypass("abort() replaced (auto-NOP armed)");
+        } catch (e) { logError("abort: " + e); }
     }
 
-    // ── Process.killProcess — prevent self-kill ─────────────────────────
-    try {
-        var Process = Java.use('android.os.Process');
-        Process.killProcess.implementation = function (pid) {
-            if (pid === Process.myPid()) {
-                log('TAMPER', 'Process.killProcess(self) -> blocked');
-                return;
+    // ── exit / _exit ─────────────────────────────────────────────────────
+    ["exit", "_exit"].forEach(function (name) {
+        var p = resolveExport(name);
+        if (!p) return;
+        try {
+            Interceptor.replace(p, new NativeCallback(function (code) {
+                _exitCount++;
+                if (_exitCount <= 3)
+                    logBypass(name + "(" + code + ") SWALLOWED" +
+                        ((code === 106 || code === 107) ? " [V-KEY KILL]" : ""));
+            }, "void", ["int"]));
+            _hookCount++;
+        } catch (e) { }
+    });
+
+    // ── kill (self-kill only) ────────────────────────────────────────────
+    var pKill = resolveExport("kill");
+    if (pKill) {
+        try {
+            var realKill = new NativeFunction(pKill, "int", ["int", "int"]);
+            Interceptor.replace(pKill, new NativeCallback(function (pid, sig) {
+                if (pid === Process.id || pid === 0) {
+                    logBypass("kill(" + pid + "," + sig + ") BLOCKED");
+                    return 0;
+                }
+                return realKill(pid, sig);
+            }, "int", ["int", "int"]));
+            _hookCount++;
+        } catch (e) { }
+    }
+
+    // ── raise ────────────────────────────────────────────────────────────
+    var pRaise = resolveExport("raise");
+    if (pRaise) {
+        try {
+            Interceptor.replace(pRaise, new NativeCallback(function (sig) {
+                logBypass("raise(" + sig + ") BLOCKED");
+                return 0;
+            }, "int", ["int"]));
+            _hookCount++;
+        } catch (e) { }
+    }
+
+    // ── sigaction — block SIGABRT/SIGTERM handler registration ───────────
+    safeAttach("sigaction", {
+        onEnter: function (args) {
+            this.block = false;
+            var sig = args[0].toInt32();
+            if (sig === 6 || sig === 9 || sig === 15) {
+                this.block = true;
             }
-            Process.killProcess(pid);
-        };
-        log('TAMPER', 'Process.killProcess hooked');
-    } catch (e) { /* not needed */ }
-
-    // ── Emulator detection bypass ───────────────────────────────────────
-    try {
-        var Build = Java.use('android.os.Build');
-        var emuIndicators = ['generic', 'emulator', 'sdk', 'goldfish', 'ranchu', 'vbox', 'genymotion'];
-        var spoofValues = {
-            'FINGERPRINT': 'google/walleye/walleye:8.1.0/OPM1.171019.021/4565141:user/release-keys',
-            'MODEL': 'Pixel 2', 'MANUFACTURER': 'Google', 'BRAND': 'google',
-            'DEVICE': 'walleye', 'PRODUCT': 'walleye', 'HARDWARE': 'walleye', 'BOARD': 'walleye',
-        };
-        for (var field in spoofValues) {
-            try {
-                var current = String(Build[field].value).toLowerCase();
-                var isEmu = false;
-                for (var j = 0; j < emuIndicators.length; j++) {
-                    if (current.indexOf(emuIndicators[j]) !== -1) { isEmu = true; break; }
-                }
-                if (isEmu) {
-                    Build[field].value = spoofValues[field];
-                    log('TAMPER', 'Build.' + field + ' spoofed');
-                }
-            } catch (e) { /* field not writable */ }
-        }
-    } catch (e) { /* not critical */ }
-
-    // ── Xposed detection bypass (StackTrace) ────────────────────────────
-    try {
-        var Thread = Java.use('java.lang.Thread');
-        Thread.getStackTrace.implementation = function () {
-            var stack = this.getStackTrace();
-            var filtered = [];
-            for (var i = 0; i < stack.length; i++) {
-                var cn = String(stack[i].getClassName());
-                if (cn.indexOf('de.robv.android.xposed') === -1 &&
-                    cn.indexOf('com.saurik.substrate') === -1) {
-                    filtered.push(stack[i]);
-                }
-            }
-            return filtered;
-        };
-        log('TAMPER', 'Thread.getStackTrace Xposed/Substrate filtered');
-    } catch (e) { /* not needed */ }
-
-    // ── Native open() — track /proc/self/status for TracerPid ───────────
-    try {
-        var openFunc = Module.findExportByName('libc.so', 'open');
-        if (openFunc) {
-            var trackedFds = {};
-            Interceptor.attach(openFunc, {
-                onEnter: function (args) {
-                    try {
-                        this.path = args[0].readUtf8String();
-                    } catch (e) { this.path = null; }
-                },
-                onLeave: function (retval) {
-                    if (this.path && this.path.indexOf('/proc/self/status') !== -1) {
-                        trackedFds[retval.toInt32()] = true;
-                    }
-                }
-            });
-
-            // Hook read() to modify TracerPid in /proc/self/status
-            var readFunc = Module.findExportByName('libc.so', 'read');
-            if (readFunc) {
-                Interceptor.attach(readFunc, {
-                    onEnter: function (args) {
-                        this.fd = args[0].toInt32();
-                        this.buf = args[1];
-                        this.isTracked = trackedFds[this.fd] || false;
-                    },
-                    onLeave: function (retval) {
-                        if (this.isTracked && retval.toInt32() > 0) {
-                            try {
-                                var content = this.buf.readUtf8String(retval.toInt32());
-                                if (content.indexOf('TracerPid') !== -1) {
-                                    var patched = content.replace(/TracerPid:\s*\d+/, 'TracerPid:\t0');
-                                    this.buf.writeUtf8String(patched);
-                                    log('TAMPER', 'TracerPid set to 0 in /proc/self/status');
-                                }
-                            } catch (e) { /* can't patch, not critical */ }
-                        }
-                    }
-                });
-            }
-            log('TAMPER', 'Native open/read hooked (TracerPid spoofing)');
-        }
-    } catch (e) { /* not critical */ }
+        },
+        onLeave: function (r) { if (this.block) r.replace(0); }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ENTRY POINT
+//  7. READLINK CONCEALMENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-console.log('');
-console.log(Color.CYAN + Color.BOLD + '  ╔══════════════════════════════════════════════════╗' + Color.RESET);
-console.log(Color.CYAN + Color.BOLD + '  ║       Universal Bypass — APK Analyzer            ║' + Color.RESET);
-console.log(Color.CYAN + Color.BOLD + '  ║   SSL Pinning + Root + Runtime Tampering          ║' + Color.RESET);
-console.log(Color.CYAN + Color.BOLD + '  ╚══════════════════════════════════════════════════╝' + Color.RESET);
-console.log('');
+function hookReadlink() {
+    var LINK_POISON = ["frida", "gum-js", "linjector", "gadget"];
 
-Java.perform(function () {
-    log('SSL',    '═══ SSL Pinning Bypass ═══');
-    bypassSSL();
-    console.log('');
+    safeAttach("readlink", {
+        onEnter: function (a) { this.buf = a[1]; },
+        onLeave: function (r) {
+            var len = r.toInt32();
+            if (len <= 0) return;
+            try {
+                var t = this.buf.readUtf8String(len);
+                if (t && containsAny(t, LINK_POISON)) {
+                    this.buf.writeUtf8String("/dev/ashmem");
+                    r.replace(11);
+                }
+            } catch (e) { }
+        }
+    });
 
-    log('ROOT',   '═══ Root Detection Bypass ═══');
-    bypassRoot();
-    console.log('');
+    safeAttach("readlinkat", {
+        onEnter: function (a) { this.buf = a[2]; },
+        onLeave: function (r) {
+            var len = r.toInt32();
+            if (len <= 0) return;
+            try {
+                var t = this.buf.readUtf8String(len);
+                if (t && containsAny(t, LINK_POISON)) {
+                    this.buf.writeUtf8String("/dev/ashmem");
+                    r.replace(11);
+                }
+            } catch (e) { }
+        }
+    });
+}
 
-    log('TAMPER', '═══ Runtime Tampering Bypass ═══');
-    bypassTampering();
-    console.log('');
+// ═══════════════════════════════════════════════════════════════════════════════
+//  8. SYSTEM PROPERTY CAMOUFLAGE — __system_property_get +
+//                                   __system_property_read_callback
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    console.log(Color.GREEN + Color.BOLD + '  [+] All bypasses loaded. App should be unprotected.' + Color.RESET);
-    console.log(Color.DIM + '  github.com/worldtreeboy/apkAnalyzer' + Color.RESET);
-    console.log('');
-});
+function hookSysProps() {
+    var PROP_SPOOF = {
+        // Anti-root
+        "ro.debuggable":                  "0",
+        "ro.secure":                      "1",
+        "ro.build.tags":                  "release-keys",
+        "ro.build.type":                  "user",
+        "ro.build.selinux":               "1",
+        // Hardware attestation / bootloader
+        "ro.boot.vbmeta.device_state":    "locked",
+        "ro.boot.flash.locked":           "1",
+        "ro.boot.verifiedbootstate":      "green",
+        "ro.boot.veritymode":             "enforcing",
+        "ro.boot.warranty_bit":           "0",
+        "ro.warranty_bit":                "0",
+        "ro.is_ever_orange":              "0",
+        // Emulator detection
+        "ro.kernel.qemu":                 "0",
+        "ro.hardware.chipname":           "exynos990",
+    };
+
+    // ── __system_property_get (classic API) ──────────────────────────────
+    safeAttach("__system_property_get", {
+        onEnter: function (args) {
+            this.name = null;
+            this.buf = args[1];
+            try { this.name = args[0].readUtf8String(); } catch (e) { }
+        },
+        onLeave: function () {
+            if (this.name && PROP_SPOOF[this.name] !== undefined) {
+                this.buf.writeUtf8String(PROP_SPOOF[this.name]);
+            }
+        }
+    });
+
+    // ── __system_property_read_callback (Android 8+ native path) ────────
+    // void __system_property_read_callback(
+    //     const prop_info *pi,
+    //     void (*callback)(void *cookie, const char *name,
+    //                      const char *value, uint32_t serial),
+    //     void *cookie)
+    //
+    // The callback is invoked synchronously. We replace args[1] with a
+    // wrapper that intercepts the (name, value) pair and spoofs if needed.
+    // Thread-safe via per-tid original callback storage.
+
+    var pReadCb = resolveExport("__system_property_read_callback");
+    if (pReadCb) {
+        var _origCbByTid = {};
+
+        var wrapperCb = new NativeCallback(function (cookie, namePtr, valuePtr, serial) {
+            var tid = Process.getCurrentThreadId();
+            var origCb = _origCbByTid[tid];
+            if (!origCb) return;
+            delete _origCbByTid[tid];
+
+            try {
+                var name = namePtr.readUtf8String();
+                if (name && PROP_SPOOF[name] !== undefined) {
+                    var fakeBuf = Memory.allocUtf8String(PROP_SPOOF[name]);
+                    origCb(cookie, namePtr, fakeBuf, serial);
+                    return;
+                }
+            } catch (e) { }
+
+            origCb(cookie, namePtr, valuePtr, serial);
+        }, "void", ["pointer", "pointer", "pointer", "uint32"]);
+
+        try {
+            Interceptor.attach(pReadCb, {
+                onEnter: function (args) {
+                    var origPtr = args[1];
+                    if (origPtr.isNull()) return;
+                    var tid = Process.getCurrentThreadId();
+                    _origCbByTid[tid] = new NativeFunction(origPtr,
+                        "void", ["pointer", "pointer", "pointer", "uint32"]);
+                    args[1] = wrapperCb;
+                }
+            });
+            _hookCount++;
+            logBypass("__system_property_read_callback hooked (Android 8+ path)");
+        } catch (e) {
+            logError("__system_property_read_callback: " + e);
+        }
+    } else {
+        logInfo("__system_property_read_callback not found (older Android?)");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  9. THREAD STEALTH — Hide Frida thread names
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var THREAD_POISON = ["gmain", "gum-js", "gdbus", "frida", "linjector", "pool-frida"];
+
+function hookThreadStealth() {
+    var pGetName = resolveExport("pthread_getname_np");
+    if (pGetName) {
+        try {
+            Interceptor.attach(pGetName, {
+                onEnter: function (a) { this.buf = a[1]; },
+                onLeave: function (r) {
+                    if (r.toInt32() !== 0) return;
+                    try {
+                        var name = this.buf.readUtf8String();
+                        if (name && containsAny(name, THREAD_POISON))
+                            this.buf.writeUtf8String("binder:" + _myPid);
+                    } catch (e) { }
+                }
+            });
+            _hookCount++;
+        } catch (e) { }
+    }
+
+    var pPrctl = resolveExport("prctl");
+    if (pPrctl) {
+        try {
+            Interceptor.attach(pPrctl, {
+                onEnter: function (a) {
+                    this.isGet = (a[0].toInt32() === 16); // PR_GET_NAME
+                    this.buf = a[1];
+                },
+                onLeave: function (r) {
+                    if (!this.isGet || r.toInt32() !== 0) return;
+                    try {
+                        var name = this.buf.readUtf8String();
+                        if (name && containsAny(name, THREAD_POISON))
+                            this.buf.writeUtf8String("binder:" + _myPid);
+                    } catch (e) { }
+                }
+            });
+            _hookCount++;
+        } catch (e) { }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAIN — Three-method pre-emptive initialization
+// ═══════════════════════════════════════════════════════════════════════════════
+
+(function main() {
+    console.log("");
+    console.log("================================================================");
+    console.log("  Universal Bypass v17 — The Pre-Emptive Strike");
+    console.log("================================================================");
+    console.log("  Method A: Linker call_constructors hook (pre-constructor)");
+    console.log("  Method B: mmap fd-tracking hook (pre-mapping)");
+    console.log("  Method C: dlopen onLeave (safety net)");
+    console.log("  NO Stalker | NO Java | Interceptor + Memory.patchCode");
+    console.log("================================================================");
+    console.log("");
+
+    try { initNativeFunctions(); } catch (e) { logError("initNativeFunctions: " + e); }
+
+    logInfo("PID=" + _myPid + " arch=" + Process.arch);
+
+    // ── Pre-Emptive Strike: install all three methods ─────────────────
+    logInfo("=== Installing Pre-Emptive Strike ===");
+    var methodA = false, methodB = false;
+    try { methodA = hookCallConstructors(); } catch (e) { logError("Method A: " + e); }
+    try { methodB = hookMmapMonitor(); }      catch (e) { logError("Method B: " + e); }
+    logInfo("Strike vectors: A(call_ctors)=" + methodA + " B(mmap)=" + methodB);
+    if (!methodA && !methodB) {
+        logError("WARNING: Neither Method A nor B available!");
+        logError("Falling back to Method C only (dlopen onLeave — may be too late)");
+    }
+
+    // ── Standard hooks ─────────────────────────────────────────────────
+    logInfo("=== Installing standard hooks ===");
+    try { initPhantom(); }           catch (e) { logError("phantom: " + e); }
+    try { hookFileSystem(); }        catch (e) { logError("fs: " + e); }
+    try { hookStringOps(); }         catch (e) { logError("str: " + e); }
+    try { hookSuicidePrevention(); } catch (e) { logError("suicide: " + e); }
+    try { hookLinker(); }            catch (e) { logError("linker: " + e); }
+    try { hookReadlink(); }          catch (e) { logError("readlink: " + e); }
+    try { hookSysProps(); }          catch (e) { logError("props: " + e); }
+    try { hookThreadStealth(); }     catch (e) { logError("stealth: " + e); }
+
+    logInfo(_hookCount + " Interceptor hooks installed");
+
+    // ── Late-attach: if V-Key already loaded, lobotomize now ──────────
+    var existing = findVKeyModule();
+    if (existing && !_lobotomized) {
+        logBypass("[LATE-ATTACH] V-Key already in memory — lobotomizing now");
+        patchCrashSite(existing);
+        lobotomize(existing);
+    }
+
+    console.log("");
+    logInfo("v17 Pre-Emptive Strike LIVE.");
+    logInfo("  Target: " + VKEY_NAMES[0] + " offset 0x" + CRASH_OFFSET.toString(16));
+    logInfo("  Patch window: mmap -> call_constructors -> dlopen");
+    logInfo("  Waiting for target to load...");
+    console.log("");
+})();
