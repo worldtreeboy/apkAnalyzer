@@ -49,9 +49,9 @@ python3 apkAnalyzer.py
 │   [3]  Shell Access          [9]  Binary Patcher     │
 │   [4]  Screenshot            [10] Frida Server       │
 │   [5]  Security Scan         [11] Testcases          │
-│   [6]  Keyboard Cache                                │
+│   [6]  Keyboard Cache        [12] Runtime Check      │
 │                                                      │
-│   [a]  Switch App   [q]  Quit                        │
+│   [a]  Switch App   [r] Export Report  [0] Exit       │
 │                                                      │
 └──────────────────────────────────────────────────────┘
 ```
@@ -61,16 +61,18 @@ python3 apkAnalyzer.py
   SECURITY SCAN — com.example.app
 ═══════════════════════════════════════════════════════
 
-  [FAIL] Debuggable                 android:debuggable="true"
-  [FAIL] allowBackup                No exclusion rules defined
-  [PASS] Cleartext Traffic          usesCleartextTraffic="false"
-  [WARN] Exported Components        3 activities, 1 provider exported
-  [FAIL] Hardcoded Secrets          Found AWS key in config.xml
-  [PASS] Network Security Config    Custom config with certificate pins
-  [FAIL] APK Signing                v1-only — Janus vulnerable (CVE-2017-13156)
+  [CRITICAL] Debuggable          android:debuggable="true"  (MASVS-RESILIENCE-1 | CWE-489)
+  [HIGH]     allowBackup          No exclusion rules defined  (MASVS-STORAGE-1 | CWE-530)
+  [PASS]     Cleartext Traffic    usesCleartextTraffic="false"
+  [HIGH]     Exported Components  3 activities, 1 provider  (MASVS-PLATFORM-1 | CWE-926)
+  [CRITICAL] Hardcoded Secrets    Found AWS key in config.xml  (MASVS-STORAGE-1 | CWE-798)
+  [PASS]     Network Security     Custom config with certificate pins
+  [HIGH]     APK Signing          v1-only — Janus (CVE-2017-13156)  (MASVS-RESILIENCE-2 | CWE-347)
   ...
-  ─────────────────────────────────────────────────────
-  Results: 11 PASS │ 5 FAIL │ 3 WARN
+  ═══════════════════════════════════════════════════════
+  CRITICAL: 2  |  HIGH: 3  |  MEDIUM: 4  |  LOW: 2
+  PASS: 11  FAIL: 5  WARN: 3
+  Overall: CRITICAL RISK
 ═══════════════════════════════════════════════════════
 ```
 
@@ -105,13 +107,15 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 2 | **Storage Audit** | SharedPrefs, SQLite, Realm DBs — scan for secrets, PII, and insecure file permissions |
 | 3 | **Shell Access** | Interactive root shell with directory tracking |
 | 4 | **Screenshot** | Capture device screen, save locally with timestamp |
-| 5 | **Security Scan** | 19 static checks scored PASS / FAIL / WARN ([details below](#-security-scan-19-checks)) |
+| 5 | **Security Scan** | 19 static checks with OWASP MASVS mapping, CWE IDs, severity scoring ([details below](#-security-scan-19-checks)) |
 | 6 | **Keyboard Cache** | Detect if keyboard apps cache plaintext input |
 | 7 | **Logcat Monitor** | Real-time filtered log streaming with keyword highlighting |
 | 8 | **Frida CodeShare** | 38 scripts across 10 categories — inject from menu ([details below](#-frida-codeshare-38-scripts)) |
 | 9 | **Binary Patcher** | Frida Gadget injection or LSPatch/Xposed embedding ([details below](#-binary-patcher)) |
 | 10 | **Frida Server** | USB/remote mode switching, port forwarding, auto server management |
 | 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder |
+| 12 | **Runtime Security Check** | ADB-based dynamic analysis: post-launch secret scanning, file permissions, exported component probing, clipboard/logcat leakage, WebView cache |
+| r | **Report Export** | Export findings to JSON or HTML with severity badges, MASVS references, and CWE IDs (`--report json\|html`) |
 
 <br>
 
@@ -120,7 +124,7 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 <details>
 <summary><h2>🔒 Security Scan (19 Checks)</h2></summary>
 
-Static analysis of the decompiled APK and AndroidManifest.xml. Results scored as **PASS** / **FAIL** / **WARN**.
+Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is scored with **CRITICAL / HIGH / MEDIUM / LOW** severity, mapped to **OWASP MASVS v2.0** categories, and tagged with **CWE IDs**. Results also shown as **PASS / FAIL / WARN** with an overall risk summary.
 
 <table>
 <tr><th>Category</th><th>Check</th><th>What It Flags</th></tr>
@@ -250,6 +254,19 @@ Scans automatically detect the app framework and adjust keyword groups:
 Native security SDKs (VKey, Zimperium, Promon, DexGuard) are detected from `.so` files on every scan.
 
 </details>
+
+---
+
+## 📊 Report Export
+
+Export findings to JSON or self-contained HTML reports with severity badges, MASVS references, and CWE IDs:
+
+```bash
+python3 apkAnalyzer.py --report html --output report.html
+python3 apkAnalyzer.py --report json --output findings.json
+```
+
+Or use the `[r] Export Report` menu option during an interactive session. HTML reports include color-coded severity badges, device info, and a findings summary table.
 
 ---
 
