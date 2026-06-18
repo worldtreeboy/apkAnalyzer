@@ -13,6 +13,9 @@ import time
 import shlex
 import shutil
 import lzma
+import zlib
+import io
+import tarfile
 import json
 import argparse
 import html as html_mod
@@ -41,7 +44,7 @@ class C:
 
 # ─── Report Collector ────────────────────────────────────────────────────────────
 
-TOOL_VERSION = "1.2"
+TOOL_VERSION = "1.3"
 
 class ReportCollector:
     """Accumulates findings throughout the session for JSON/HTML export."""
@@ -909,7 +912,6 @@ def _analyze_nsc(decompiled_dir):
         # Check domain-config cleartext
         for dc in root.findall(".//domain-config"):
             if dc.get("cleartextTrafficPermitted") == "true":
-                domains = [d.text for d in dc.findall("domain") if d.text]
                 info["cleartext_allowed"] = True
 
         # Pin-set entries
@@ -918,7 +920,6 @@ def _analyze_nsc(decompiled_dir):
             for pin in ps.findall("pin"):
                 digest = pin.get("digest", "")
                 val = pin.text or ""
-                parent_dc = ps.find("..")
                 # Get associated domains
                 domains = []
                 for dc in root.findall(".//domain-config"):
@@ -1498,7 +1499,7 @@ def storage_audit(pkg):
                                             'auth', 'login', 'profile', 'setting', 'config',
                                             'cache', 'payment', 'card', 'address', 'contact',
                                             'transaction', 'order', 'customer', 'member']
-                        if count != "?" and int(count) > 0:
+                        if count != "?" and count.isdigit() and int(count) > 0:
                             sample = adb_su(f"sqlite3 {dbf} 'SELECT * FROM {table} LIMIT 5' 2>/dev/null", timeout=5)
                             if sample and not sample.startswith("["):
                                 # Show raw rows for sensitive-looking tables
@@ -1957,6 +1958,10 @@ def security_scan(pkg):
     except Exception:
         print(f"  {C.RED}[!] Could not read AndroidManifest.xml{C.RST}")
 
+    # ── Framework & Native SDK Detection ─────────────────────────────────────
+    fw_info = detect_framework(decompiled_dir)
+    _print_framework_info(fw_info)
+
     # ── 1. Debuggable ────────────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Debuggable Check ──{C.RST}")
     total_checks_run += 1
@@ -2215,24 +2220,93 @@ def security_scan(pkg):
         pass_fail("Deeplinks", True, "No custom deeplink schemes found")
         passes += 1
 
+    # ── Single-pass scan of decompiled smali/xml (checks 10-18) ──────────────
+    # Reads each .smali/.xml file exactly once and accumulates every signal,
+    # instead of re-walking the whole tree (and re-reading every file) per check.
+    jsinterface_found = False
+    mutable_pending = False
+    immutable_pending = False
+    unprotected_broadcasts = 0
+    protected_broadcasts = 0
+    flag_secure_found = False
+    clip_usage = 0
+    clip_protection = 0
+    clip_files = []
+    log_hits = {}
+    pw_fields = 0
+    nosuggest = 0
+    has_filter_touches = False
+
+    log_keywords = {
+        "Java":   ['Landroid/util/Log;->v(', 'Landroid/util/Log;->d('],
+        "Kotlin": ['Timber;->d(', 'Timber;->v('],
+        "Flutter": ['debugPrint', 'kDebugMode'],
+        "React Native": ['console.log', 'console.debug'],
+    }
+
+    for root, dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            is_smali = fname.endswith('.smali')
+            is_xml = fname.endswith('.xml')
+            if not (is_smali or is_xml):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', errors='ignore') as fh:
+                    content = fh.read()
+            except Exception:
+                continue
+
+            if is_smali:
+                # WebView JS interface
+                if not jsinterface_found and 'addJavascriptInterface' in content:
+                    jsinterface_found = True
+                # PendingIntent mutability
+                if 'PendingIntent;->get' in content:
+                    if 'FLAG_IMMUTABLE' in content or 'FLAG_MUTABLE' in content:
+                        immutable_pending = True
+                    else:
+                        mutable_pending = True
+                # Broadcast security
+                if 'sendBroadcast(Landroid/content/Intent;)V' in content:
+                    if 'LocalBroadcastManager' not in content:
+                        unprotected_broadcasts += 1
+                if 'sendBroadcast(Landroid/content/Intent;Ljava/lang/String;)V' in content:
+                    protected_broadcasts += 1
+                # FLAG_SECURE
+                if not flag_secure_found and ('FLAG_SECURE' in content or 'setFlags(8192' in content):
+                    flag_secure_found = True
+                # Clipboard usage
+                if any(kw in content for kw in
+                       ('ClipboardManager', 'ClipData', 'setPrimaryClip', 'getPrimaryClip')):
+                    clip_usage += 1
+                    clip_files.append(os.path.relpath(fpath, decompiled_dir))
+                if 'FLAG_SENSITIVE' in content or 'isSensitive' in content:
+                    clip_protection += 1
+                # Debug / verbose logging
+                for framework, kws in log_keywords.items():
+                    for kw in kws:
+                        if kw in content:
+                            log_hits[framework] = log_hits.get(framework, 0) + 1
+                # Tapjacking
+                if not has_filter_touches and 'filterTouchesWhenObscured' in content:
+                    has_filter_touches = True
+
+            if is_xml:
+                # Keyboard cache / secure input types
+                for kw in ('textPassword', 'textVisiblePassword', 'numberPassword', 'textWebPassword'):
+                    if kw in content:
+                        pw_fields += content.count(kw)
+                for kw in ('textNoSuggestions', 'flagNoPersonalizedLearning'):
+                    if kw in content:
+                        nosuggest += content.count(kw)
+                # Tapjacking (also declared in layouts)
+                if not has_filter_touches and 'filterTouchesWhenObscured' in content:
+                    has_filter_touches = True
+
     # ── 10. WebView JavaScript Interface ─────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── WebView Security ──{C.RST}")
     total_checks_run += 1
-    jsinterface_found = False
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    if 'addJavascriptInterface' in content:
-                        jsinterface_found = True
-                        break
-                except Exception:
-                    continue
-        if jsinterface_found:
-            break
     if jsinterface_found:
         _finding_line("webview_js_interface", "WebView.addJavascriptInterface() used", "Verify SDK >= 17 protection")
         fails += 1
@@ -2246,22 +2320,6 @@ def security_scan(pkg):
     # ── 11. Pending Intent Mutability ────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Pending Intent Security ──{C.RST}")
     total_checks_run += 1
-    mutable_pending = False
-    immutable_pending = False
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    if 'PendingIntent;->get' in content:
-                        if 'FLAG_IMMUTABLE' in content or 'FLAG_MUTABLE' in content:
-                            immutable_pending = True
-                        else:
-                            mutable_pending = True
-                except Exception:
-                    continue
     if mutable_pending and not immutable_pending:
         _finding_line("pending_intent_mutable", "PendingIntent without FLAG_IMMUTABLE/FLAG_MUTABLE", "SDK 31+ required")
         fails += 1
@@ -2277,25 +2335,6 @@ def security_scan(pkg):
     # ── 12. Implicit Broadcast ───────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Broadcast Security ──{C.RST}")
     total_checks_run += 1
-    unprotected_broadcasts = 0
-    protected_broadcasts = 0
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    # sendBroadcast(Intent) without permission — single arg
-                    if 'sendBroadcast(Landroid/content/Intent;)V' in content:
-                        # Check it's not LocalBroadcastManager (safe)
-                        if 'LocalBroadcastManager' not in content:
-                            unprotected_broadcasts += 1
-                    # sendBroadcast(Intent, String) with permission — safe
-                    if 'sendBroadcast(Landroid/content/Intent;Ljava/lang/String;)V' in content:
-                        protected_broadcasts += 1
-                except Exception:
-                    continue
     if unprotected_broadcasts > 0:
         _finding_line("unprotected_broadcasts", f"sendBroadcast() without permission in {unprotected_broadcasts} file(s)")
         fails += 1
@@ -2313,21 +2352,6 @@ def security_scan(pkg):
     # ── 13. Screenshot Protection (FLAG_SECURE) ──────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Screenshot Protection ──{C.RST}")
     total_checks_run += 1
-    flag_secure_found = False
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    if 'FLAG_SECURE' in content or 'setFlags(8192' in content:
-                        flag_secure_found = True
-                        break
-                except Exception:
-                    continue
-        if flag_secure_found:
-            break
     if flag_secure_found:
         pass_fail("FLAG_SECURE", True, "Screenshot protection detected")
         passes += 1
@@ -2340,26 +2364,6 @@ def security_scan(pkg):
     # ── 14. Clipboard Data Exposure ──────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Clipboard Data Exposure ──{C.RST}")
     total_checks_run += 1
-    clip_usage = 0
-    clip_protection = 0
-    clip_files = []
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    has_clip = any(kw in content for kw in
-                                  ('ClipboardManager', 'ClipData', 'setPrimaryClip', 'getPrimaryClip'))
-                    if has_clip:
-                        clip_usage += 1
-                        rel = os.path.relpath(fpath, decompiled_dir)
-                        clip_files.append(rel)
-                    if 'FLAG_SENSITIVE' in content or 'isSensitive' in content:
-                        clip_protection += 1
-                except Exception:
-                    continue
     if clip_usage > 0 and clip_protection == 0:
         _finding_line("clipboard_exposure", f"Clipboard used without FLAG_SENSITIVE protection ({clip_usage} file(s))")
         warns += 1
@@ -2377,26 +2381,6 @@ def security_scan(pkg):
     # ── 15. Debug / Verbose Logging ──────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Debug / Verbose Logging ──{C.RST}")
     total_checks_run += 1
-    log_keywords = {
-        "Java":   ['Landroid/util/Log;->v(', 'Landroid/util/Log;->d('],
-        "Kotlin": ['Timber;->d(', 'Timber;->v('],
-        "Flutter": ['debugPrint', 'kDebugMode'],
-        "React Native": ['console.log', 'console.debug'],
-    }
-    log_hits = {}
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.smali'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    for framework, kws in log_keywords.items():
-                        for kw in kws:
-                            if kw in content:
-                                log_hits[framework] = log_hits.get(framework, 0) + 1
-                except Exception:
-                    continue
     if log_hits:
         total = sum(log_hits.values())
         _finding_line("debug_logging", f"Debug/verbose log calls found ({total} file(s))")
@@ -2413,23 +2397,6 @@ def security_scan(pkg):
     # ── 16. Keyboard Cache / Input Types ─────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Keyboard Cache ──{C.RST}")
     total_checks_run += 1
-    pw_fields = 0
-    nosuggest = 0
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith('.xml'):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    for kw in ('textPassword', 'textVisiblePassword', 'numberPassword', 'textWebPassword'):
-                        if kw in content:
-                            pw_fields += content.count(kw)
-                    for kw in ('textNoSuggestions', 'flagNoPersonalizedLearning'):
-                        if kw in content:
-                            nosuggest += content.count(kw)
-                except Exception:
-                    continue
     if pw_fields:
         pass_fail("Secure input types", True, f"{pw_fields} password-type field(s) found")
         passes += 1
@@ -2482,21 +2449,6 @@ def security_scan(pkg):
     # ── 18. Tapjacking Protection ────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Tapjacking Protection ──{C.RST}")
     total_checks_run += 1
-    has_filter_touches = False
-    for root, dirs, files in os.walk(decompiled_dir):
-        for fname in files:
-            if fname.endswith(('.xml', '.smali')):
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                    if 'filterTouchesWhenObscured' in content:
-                        has_filter_touches = True
-                        break
-                except Exception:
-                    continue
-        if has_filter_touches:
-            break
     if has_filter_touches:
         pass_fail("Tapjacking", True, "filterTouchesWhenObscured detected")
         passes += 1
@@ -2567,6 +2519,19 @@ def security_scan(pkg):
         info_line("APK signing", "apksigner not found — skipping (install Android SDK build-tools)")
     else:
         info_line("APK signing", "APK file not found locally — skipping")
+
+    # ── Additional Static Analysis (informational) ───────────────────────────
+    # Network Security Config detail: cert pins, cleartext policy, user-CA trust
+    _print_nsc_analysis(_analyze_nsc(decompiled_dir))
+
+    # Known security / anti-tamper libraries detected in the smali class tree
+    _print_security_classes(_check_security_classes(decompiled_dir))
+
+    # Security-relevant strings inside native .so libraries (root/frida/SSL/etc.)
+    native_str_results = _scan_native_strings(decompiled_dir)
+    if native_str_results:
+        print(f"\n  {C.CYAN}{C.BOLD}── NATIVE LIBRARY STRINGS ──{C.RST}")
+        _print_native_strings(native_str_results)
 
     # ── Risk Summary with MASVS Severity ─────────────────────────────────────
     print(f"\n  {C.CYAN}{'=' * 56}{C.RST}")
@@ -2718,6 +2683,7 @@ def logcat_monitor(pkg):
     print(f"  {C.CYAN}{'═'*50}{C.RST}\n")
 
     search_lower = search_str.lower()
+    proc = None
     try:
         proc = subprocess.Popen(
             ["adb", "logcat"],
@@ -2735,12 +2701,15 @@ def logcat_monitor(pkg):
                 print(f"  > {highlighted}")
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"  {C.RED}[!] Logcat failed: {e}{C.RST}")
     finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            proc.kill()
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
 
     print(f"\n\n  {C.CYAN}{'═'*50}{C.RST}")
     print(f"  {C.DIM}Logcat monitor stopped.{C.RST}")
@@ -3579,6 +3548,234 @@ def _parse_exported_components(manifest):
 
     return exported
 
+# ─── ADB Backup Extraction (allowBackup=true vector) ─────────────────────────────
+
+def _unpack_ab(ab_path, out_dir):
+    """Parse an Android .ab backup and extract its tar payload into out_dir.
+
+    Returns (file_count, error_message_or_None). Path traversal inside the tar
+    is neutralized — every entry is confined to out_dir."""
+    try:
+        with open(ab_path, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        return 0, f"could not read backup file: {e}"
+
+    if not raw.startswith(b"ANDROID BACKUP"):
+        return 0, "not a valid Android backup (missing 'ANDROID BACKUP' header)"
+
+    # Header = 4 newline-separated lines: magic, version, compression, encryption
+    parts = raw.split(b"\n", 4)
+    if len(parts) < 5:
+        return 0, "backup is empty or truncated (on-device confirmation likely declined)"
+
+    compressed = parts[2].strip() == b"1"
+    encryption = parts[3].strip()
+    payload = parts[4]
+
+    if encryption != b"none":
+        enc = encryption.decode("ascii", "replace")
+        return 0, f"backup is encrypted ({enc}); password-protected backups are not supported"
+    if not payload:
+        return 0, "backup contains no data (app disallows backup or returned an empty set)"
+
+    try:
+        tar_bytes = zlib.decompress(payload) if compressed else payload
+    except Exception as e:
+        return 0, f"payload decompression failed: {e}"
+
+    count = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                # Confine to out_dir: drop empty/./.. path components
+                safe_parts = [p for p in member.name.split("/") if p not in ("", ".", "..")]
+                if not safe_parts:
+                    continue
+                dest = os.path.join(out_dir, *safe_parts)
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    src = tar.extractfile(member)
+                    if src is None:
+                        continue
+                    with open(dest, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    count += 1
+                except Exception:
+                    continue
+    except Exception as e:
+        return 0, f"tar extraction failed: {e}"
+
+    return count, None
+
+
+def backup_extraction(pkg):
+    """Demonstrate data exfiltration via 'adb backup' when allowBackup=true.
+
+    Runs a (non-root) backup, unpacks the .ab archive, and scans the contents
+    for secrets/PII with the existing detection engine. Findings feed the report."""
+    section("ADB BACKUP EXTRACTION")
+    print(f"\n  {C.CYAN}Target: {C.BOLD}{pkg}{C.RST}")
+    print(f"  {C.DIM}Demonstrates the allowBackup=true data-extraction vector (no root needed).{C.RST}\n")
+
+    # ── Fast allowBackup check via dumpsys flags (no decompile) ───────────────
+    flags_out = adb_su(f"dumpsys package {pkg} | grep -i flags", timeout=15)
+    allow_backup = True
+    if flags_out and not flags_out.startswith("["):
+        allow_backup = "ALLOW_BACKUP" in flags_out
+    if not allow_backup:
+        print(f"  {C.YELLOW}[!] allowBackup appears DISABLED for this app.{C.RST}")
+        print(f"  {C.DIM}The backup will most likely be empty, but you can still try.{C.RST}")
+        try:
+            cont = input(f"\n  {C.GREEN}Attempt backup anyway? [y/N] ▸ {C.RST}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            pause()
+            return
+        if cont != "y":
+            pause()
+            return
+    else:
+        print(f"  {C.GREEN}[+] allowBackup is enabled — app data is backup-eligible.{C.RST}")
+
+    out_base = os.path.join(os.getcwd(), "backups")
+    os.makedirs(out_base, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ab_path = os.path.join(out_base, f"{pkg}_{ts}.ab")
+
+    # ── Run adb backup (interactive: device shows a confirmation dialog) ──────
+    print(f"\n  {C.YELLOW}{C.BOLD}── On the device ──{C.RST}")
+    print(f"  {C.WHITE}A backup confirmation will appear on the device screen.{C.RST}")
+    print(f"  {C.WHITE}Tap {C.BOLD}\"Back up my data\"{C.RST}{C.WHITE} and leave the password field EMPTY.{C.RST}")
+    print(f"  {C.DIM}(Unlock the device first if the screen is off.){C.RST}")
+    try:
+        input(f"\n  {C.GREEN}Press Enter to start the backup ▸ {C.RST}")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        pause()
+        return
+
+    print(f"\n  {C.CYAN}[*] Running: adb backup -f {os.path.basename(ab_path)} -noapk -noshared {pkg}{C.RST}")
+    print(f"  {C.DIM}Waiting for on-device confirmation...{C.RST}")
+    try:
+        # No output capture: let the user see adb's prompt; the dialog is on-device.
+        subprocess.run(
+            ["adb", "backup", "-f", ab_path, "-noapk", "-noshared", pkg],
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  {C.RED}[!] Backup timed out — confirmation may not have been tapped.{C.RST}")
+        pause()
+        return
+    except Exception as e:
+        print(f"  {C.RED}[!] adb backup failed: {e}{C.RST}")
+        pause()
+        return
+
+    if not os.path.exists(ab_path) or os.path.getsize(ab_path) == 0:
+        print(f"  {C.RED}[!] No backup data produced (declined, or backup restricted on this device).{C.RST}")
+        print(f"  {C.DIM}Note: adb backup is deprecated/limited on Android 12+ and many OEM builds.{C.RST}")
+        pause()
+        return
+
+    ab_size = os.path.getsize(ab_path)
+    print(f"  {C.GREEN}[+] Backup written: {ab_path} ({ab_size // 1024} KB){C.RST}")
+
+    # ── Unpack the .ab ───────────────────────────────────────────────────────
+    extract_dir = os.path.join(out_base, f"{pkg}_{ts}_unpacked")
+    os.makedirs(extract_dir, exist_ok=True)
+    print(f"  {C.DIM}Unpacking backup archive...{C.RST}")
+    count, err = _unpack_ab(ab_path, extract_dir)
+    if err:
+        print(f"  {C.RED}[!] {err}{C.RST}")
+        pause()
+        return
+    if count == 0:
+        print(f"  {C.YELLOW}[!] Backup unpacked but contained no files.{C.RST}")
+        pause()
+        return
+    print(f"  {C.GREEN}[+] Extracted {count} file(s) → {extract_dir}{C.RST}")
+
+    # Record the exploitable-backup finding itself
+    report.add_finding(
+        "Backup: Data Extraction",
+        "App data extracted via adb backup",
+        "HIGH", "HIGH",
+        f"Extracted {count} file(s) from {pkg} using 'adb backup' without root. allowBackup is enabled.",
+        "Set android:allowBackup=false, or define dataExtractionRules/fullBackupContent to exclude sensitive data.",
+        "MASVS-STORAGE-1", "CWE-530",
+    )
+
+    # ── Scan extracted files for secrets / PII ───────────────────────────────
+    print(f"\n  {C.YELLOW}{C.BOLD}── Scanning Extracted Data ──{C.RST}")
+    secrets_files = 0
+    pii_files = 0
+    for root, dirs, files in os.walk(extract_dir):
+        for fn in files:
+            fpath = os.path.join(root, fn)
+            try:
+                if os.path.getsize(fpath) > 2_000_000:  # skip very large files
+                    continue
+                with open(fpath, "r", errors="ignore") as fh:
+                    content = fh.read()
+            except Exception:
+                continue
+            if not content:
+                continue
+            # Binary heuristic: skip files with many non-printable bytes
+            sample = content[:512]
+            non_print = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\n\r\t")
+            if sample and non_print > len(sample) * 0.3:
+                continue
+
+            rel = os.path.relpath(fpath, extract_dir)
+            secret_hits = []
+            for pattern in SECRET_PATTERNS:
+                for m in re.findall(pattern, content)[:3]:
+                    val = m if isinstance(m, str) else m[0]
+                    secret_hits.append(val[:80])
+            pii_hits = _scan_pii(content)
+
+            if secret_hits or pii_hits:
+                print(f"\n    {C.CYAN}{rel}{C.RST}")
+            if secret_hits:
+                secrets_files += 1
+                for sh in secret_hits[:5]:
+                    print(f"      {C.RED}⚠ Potential secret: {sh}{C.RST}")
+                report.add_finding(
+                    "Backup: Sensitive Data", f"Secret in backup: {rel}",
+                    "HIGH", "MEDIUM",
+                    f"Secret pattern found in backed-up file {rel}: {secret_hits[0]}",
+                    "Exclude sensitive files from backup; never store secrets unencrypted in app data.",
+                    "MASVS-STORAGE-1", "CWE-312",
+                )
+            if pii_hits:
+                pii_files += 1
+                for label, val in pii_hits[:5]:
+                    print(f"      {C.RED}⚠ PII ({label}): {val}{C.RST}")
+                report.add_finding(
+                    "Backup: Sensitive Data", f"PII in backup: {rel}",
+                    "MEDIUM", "MEDIUM",
+                    f"PII ({pii_hits[0][0]}) found in backed-up file {rel}.",
+                    "Exclude personal data from backups or encrypt sensitive data at rest.",
+                    "MASVS-STORAGE-2", "CWE-359",
+                )
+
+    # ── Result ───────────────────────────────────────────────────────────────
+    print(f"\n  {C.CYAN}{'═'*50}{C.RST}")
+    if secrets_files or pii_files:
+        print(f"  {C.RED}{C.BOLD}RESULT: Backup exposes sensitive data{C.RST}")
+        print(f"  {C.DIM}Secrets in {secrets_files} file(s), PII in {pii_files} file(s).{C.RST}")
+        print(f"  {C.DIM}Anyone with USB/ADB access can extract this without root.{C.RST}")
+    else:
+        print(f"  {C.GREEN}{C.BOLD}RESULT: Backup succeeded but no obvious secrets/PII found{C.RST}")
+        print(f"  {C.DIM}Data still extracted to {extract_dir} — review manually.{C.RST}")
+    print(f"  {C.DIM}Findings added to the report (export with [r]).{C.RST}")
+    pause()
+
+
 def fun_testcases(pkg):
     section("TESTCASES FOR FUN")
 
@@ -3598,6 +3795,8 @@ def fun_testcases(pkg):
         print(f"      {C.DIM}Search decompiled code for internal/dev URLs{C.RST}")
         print(f"  {C.YELLOW}[7]{C.RST} {C.WHITE}Repackaging Integrity Check{C.RST}")
         print(f"      {C.DIM}Launch patched APK and check if integrity checks kill it{C.RST}")
+        print(f"  {C.YELLOW}[8]{C.RST} {C.WHITE}ADB Backup Extraction{C.RST}")
+        print(f"      {C.DIM}Pull & unpack app data via adb backup (allowBackup vector){C.RST}")
         print(f"\n  {C.DIM}[0] Back{C.RST}")
 
         choice = input(f"\n  {C.GREEN}Select test ▸ {C.RST}").strip()
@@ -4139,6 +4338,10 @@ def fun_testcases(pkg):
                 print(f"  {C.DIM}• OR the integrity check is deferred (server-side, next API call, etc.){C.RST}")
                 print(f"  {C.DIM}• Recommend: also test with the app fully functional (login, API calls){C.RST}")
             pause()
+
+        elif choice == "8":
+            # ── ADB Backup Extraction ─────────────────────────────────────
+            backup_extraction(pkg)
 
         else:
             print(f"  {C.RED}Invalid option.{C.RST}")

@@ -113,7 +113,7 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 8 | **Frida CodeShare** | 38 scripts across 10 categories — inject from menu ([details below](#-frida-codeshare-38-scripts)) |
 | 9 | **Binary Patcher** | Frida Gadget injection or LSPatch/Xposed embedding ([details below](#-binary-patcher)) |
 | 10 | **Frida Server** | USB/remote mode switching, port forwarding, auto server management |
-| 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder |
+| 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder, **adb backup extraction** |
 | 12 | **Runtime Security Check** | ADB-based dynamic analysis: post-launch secret scanning, file permissions, exported component probing, clipboard/logcat leakage, WebView cache |
 | r | **Report Export** | Export findings to JSON or HTML with severity badges, MASVS references, and CWE IDs (`--report json\|html`) |
 
@@ -289,6 +289,7 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 ./extracted_apks/      ← Pulled APKs from device
 ./patched_apks/        ← Frida Gadget / LSPatch output
 ./screenshots/         ← Device screenshots
+./backups/             ← adb backup .ab files + unpacked app data
 ./.gadget_cache/       ← Cached Frida Gadget & LSPatch jar
 ./.apkanalyzer_tmp/    ← Decompiled APK cache (reused across scans)
 ```

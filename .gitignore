@@ -3,5 +3,8 @@ __pycache__/
 .apkanalyzer_tmp/
 .apkpatcher_work/
 extracted_apks/
+patched_apks/
+.gadget_cache/
+backups/
 pulled_files/
 screenshots/
