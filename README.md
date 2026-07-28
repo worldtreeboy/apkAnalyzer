@@ -9,7 +9,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.6+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL%20%7C%20macOS-lightgrey)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL%20%7C%20macOS-lightgrey)]()
 [![ADB](https://img.shields.io/badge/Requires-ADB%20%2B%20Root-orange)]()
 [![Frida](https://img.shields.io/badge/Frida-Integrated-blueviolet?logo=frida)](https://frida.re)
 
@@ -93,9 +93,24 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 🧬 | **Universal bypass script** — SSL + root + anti-tamper in a single file |
 | 🔧 | **Binary patching** — Frida Gadget or LSPatch injection in one command |
 | 📦 | **Zero dependencies** — pure Python stdlib, no pip, no Docker |
-| ⚡ | **Smart caching** — decompile once, reuse across all 11 tools |
+| ⚡ | **Smart caching** — decompile once, reuse across all tools, auto-invalidated when the app updates |
+| 🚀 | **Batched ADB** — storage audit reads ~30 files per round-trip, 50× faster on big apps |
+| 🔌 | **Multi-device support** — pick a device when several are connected, all commands follow |
 | 🔎 | **~40 secret patterns** — catches AWS, Firebase, Stripe, GitHub tokens & more |
 | 🤖 | **Framework-aware** — auto-detects Flutter, React Native, Kotlin and adjusts scans |
+
+<br>
+
+## 🆕 What's New in v1.4
+
+- 🔌 **Multi-device support** — when several devices are connected, pick one at startup; every adb command targets it (`-s <serial>`)
+- 🚀 **50× faster Storage Audit** — batched file reads (~30 files per adb round-trip) replace per-file `cat`/`stat` calls
+- 🧠 **Smarter decompile cache** — auto-invalidated when the app is updated on-device (versionCode check), no more stale scans
+- 🧾 **Unified manifest engine** — one real XML parser for all checks; now catches **implicitly exported** components and treats missing `allowBackup` as enabled (matching Android's actual default)
+- 🧬 **Frida Gadget auto-match** — gadget download now follows the device ABI (arm64/arm/x86/x86_64) and your local Frida version, with a client/server version-mismatch warning
+- 🪟 **Better Windows support** — native library string scanning works without `strings` (pure-Python fallback), shell paths fixed
+- 🛡️ **More accurate scans** — patched APKs in `patched_apks/` no longer contaminate security scans, split-APK apps warn instead of silently scanning only `base.apk`, duplicate findings removed
+- ⚡ **Faster runtime checks** — the app is launched once instead of three times
 
 <br>
 
@@ -221,10 +236,10 @@ Two methods for non-rooted analysis:
 
 ### Frida Gadget
 
-Injects `frida-gadget.so` into the APK for rootless dynamic analysis.
+Injects `frida-gadget.so` into the APK for rootless dynamic analysis. The gadget is **auto-matched to the device ABI** (arm64/arm/x86/x86_64) **and your local Frida version** to avoid client/server mismatches.
 
 ```
-Check deps → Download gadget → Decompile → Patch manifest → Inject smali
+Check deps → Detect ABI → Download gadget → Decompile → Patch manifest → Inject smali
 → Copy .so → Rebuild → Sign → Output: patched_apks/<pkg>_gadget_patched.apk
 ```
 
@@ -275,11 +290,12 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 | Requirement | Required | Notes |
 |-------------|:--------:|-------|
 | Python 3.6+ | **Yes** | No pip packages needed |
-| ADB | **Yes** | Must be in PATH |
-| Rooted device | **Yes** | Connected via USB |
+| ADB | **Yes** | Must be in PATH (checked at startup) |
+| Rooted device | **Yes** | Connected via USB; multiple devices supported |
 | `apktool` | **Yes** | [Install guide](https://ibotpeaches.github.io/Apktool/) |
 | `apksigner` | Optional | For APK signing scheme check |
 | `frida` + `frida-tools` | Optional | For Frida scripts |
+| `strings` (binutils) | Optional | Native lib string scan; pure-Python fallback included |
 
 ---
 
