@@ -31,14 +31,6 @@ python3 apkAnalyzer.py
 
 > **That's it.** No `pip install`. No Docker. No config files. Just plug in a rooted device and go.
 
-Or download the runnable JAR from the [v1.5.0 release](https://github.com/worldtreeboy/apkAnalyzer/releases/tag/v1.5.0):
-
-```bash
-java -jar apkAnalyzer-1.5.0.jar
-```
-
-The JAR bundles the analyzer and Frida script, but still requires Python 3.8+ and ADB on `PATH`. Verify it with the published `.sha256` file before running it.
-
 <br>
 
 ## 🎬 Demo
@@ -117,7 +109,6 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 - 🧠 **Stronger cache invalidation** — update time and code path now prevent same-version reinstalls or stale local APKs from contaminating scans
 - 🧬 **Reliable Frida patches** — Gadget is injected for the APK's actual ABIs, smali register allocation is valid, downloads are bounded, and the LSPatch JAR is SHA-256 pinned
 - 🔒 **Secret-safe output** — full regex matches are detected correctly and secret/PII values are redacted in findings and reports
-- ☕ **Runnable release JAR** — a small Java launcher bundles the analyzer and universal Frida script; reproducible build and SHA-256 output included
 - ✅ **Regression suite** — command transport, manifest defaults, archive extraction, secret matching, and patcher injection are covered by automated tests
 
 <br>
@@ -297,8 +288,7 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 
 | Requirement | Required | Notes |
 |-------------|:--------:|-------|
-| Python 3.8+ | **Yes** | No pip packages needed; also required by the JAR launcher |
-| Java 8+ | JAR only | Not needed when running `python3 apkAnalyzer.py` directly |
+| Python 3.8+ | **Yes** | No pip packages needed |
 | ADB | **Yes** | Must be in PATH (checked at startup) |
 | Rooted device | **Yes** | Connected via USB; multiple devices supported |
 | `apktool` | **Yes** | [Install guide](https://ibotpeaches.github.io/Apktool/) |
