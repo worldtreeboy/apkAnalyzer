@@ -7,7 +7,7 @@
 **Static analysis. Dynamic analysis. Frida instrumentation. Binary patching.**
 **One tool. One terminal. Zero dependencies.**
 
-[![Python](https://img.shields.io/badge/Python-3.6+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL%20%7C%20macOS-lightgrey)]()
 [![ADB](https://img.shields.io/badge/Requires-ADB%20%2B%20Root-orange)]()
@@ -30,6 +30,14 @@ python3 apkAnalyzer.py
 ```
 
 > **That's it.** No `pip install`. No Docker. No config files. Just plug in a rooted device and go.
+
+Or download the runnable JAR from the [v1.5.0 release](https://github.com/worldtreeboy/apkAnalyzer/releases/tag/v1.5.0):
+
+```bash
+java -jar apkAnalyzer-1.5.0.jar
+```
+
+The JAR bundles the analyzer and Frida script, but still requires Python 3.8+ and ADB on `PATH`. Verify it with the published `.sha256` file before running it.
 
 <br>
 
@@ -96,25 +104,25 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | ⚡ | **Smart caching** — decompile once, reuse across all tools, auto-invalidated when the app updates |
 | 🚀 | **Batched ADB** — storage audit reads ~30 files per round-trip, 50× faster on big apps |
 | 🔌 | **Multi-device support** — pick a device when several are connected, all commands follow |
-| 🔎 | **~40 secret patterns** — catches AWS, Firebase, Stripe, GitHub tokens & more |
+| 🔎 | **34 high-signal secret patterns** — catches AWS, Firebase, Stripe, GitHub tokens & more without treating public IDs as secrets |
 | 🤖 | **Framework-aware** — auto-detects Flutter, React Native, Kotlin and adjusts scans |
 
 <br>
 
-## 🆕 What's New in v1.4
+## 🆕 What's New in v1.5.0
 
-- 🔌 **Multi-device support** — when several devices are connected, pick one at startup; every adb command targets it (`-s <serial>`)
-- 🚀 **50× faster Storage Audit** — batched file reads (~30 files per adb round-trip) replace per-file `cat`/`stat` calls
-- 🧠 **Smarter decompile cache** — auto-invalidated when the app is updated on-device (versionCode check), no more stale scans
-- 🧾 **Unified manifest engine** — one real XML parser for all checks; now catches **implicitly exported** components and treats missing `allowBackup` as enabled (matching Android's actual default)
-- 🧬 **Frida Gadget auto-match** — gadget download now follows the device ABI (arm64/arm/x86/x86_64) and your local Frida version, with a client/server version-mismatch warning
-- 🪟 **Better Windows support** — native library string scanning works without `strings` (pure-Python fallback), shell paths fixed
-- 🛡️ **More accurate scans** — patched APKs in `patched_apks/` no longer contaminate security scans, split-APK apps warn instead of silently scanning only `base.apk`, duplicate findings removed
-- ⚡ **Faster runtime checks** — the app is launched once instead of three times
+- 🐚 **Root shell repaired** — compound commands, quotes, pipes, arguments, and `cd` now survive the ADB → `su -c` boundary correctly on every host OS
+- 🛡️ **Safer untrusted input handling** — bounded Android-backup extraction, Windows/POSIX traversal protection, safe XML parsing, terminal-control filtering, and quoted manifest/database values
+- 🎯 **More accurate findings** — launcher activities, normal permissions, public IDs, empty caches, absent password layouts, debug-only CAs, and platform cleartext defaults no longer become false vulnerabilities
+- 🧠 **Stronger cache invalidation** — update time and code path now prevent same-version reinstalls or stale local APKs from contaminating scans
+- 🧬 **Reliable Frida patches** — Gadget is injected for the APK's actual ABIs, smali register allocation is valid, downloads are bounded, and the LSPatch JAR is SHA-256 pinned
+- 🔒 **Secret-safe output** — full regex matches are detected correctly and secret/PII values are redacted in findings and reports
+- ☕ **Runnable release JAR** — a small Java launcher bundles the analyzer and universal Frida script; reproducible build and SHA-256 output included
+- ✅ **Regression suite** — command transport, manifest defaults, archive extraction, secret matching, and patcher injection are covered by automated tests
 
 <br>
 
-## 📋 All 11 Features
+## 📋 All 12 Features
 
 | # | Feature | What It Does |
 |:-:|---------|-------------|
@@ -146,11 +154,11 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 <tr><td rowspan="4"><b>Manifest</b></td>
   <td>Debuggable</td><td><code>android:debuggable="true"</code></td></tr>
 <tr><td>allowBackup</td><td>Backup enabled without exclusion rules</td></tr>
-<tr><td>Exported Components</td><td>Activities, services, receivers, providers with <code>exported="true"</code></td></tr>
-<tr><td>Dangerous Permissions</td><td>CAMERA, LOCATION, SMS, RECORD_AUDIO, etc.</td></tr>
+<tr><td>Exported Components</td><td>Non-launcher components exported without strong manifest permissions</td></tr>
+<tr><td>Dangerous Permissions</td><td>Informational review of CAMERA, LOCATION, SMS, RECORD_AUDIO, etc.</td></tr>
 <tr><td rowspan="3"><b>Network</b></td>
-  <td>Cleartext Traffic</td><td><code>usesCleartextTraffic="true"</code></td></tr>
-<tr><td>Network Security Config</td><td>Missing config or trusts user CAs</td></tr>
+  <td>Cleartext Traffic</td><td>Effective manifest, target-SDK, and network-config policy allows HTTP</td></tr>
+<tr><td>Network Security Config</td><td>Production policy trusts user-installed CAs</td></tr>
 <tr><td>Deeplinks</td><td>Custom URI schemes without validation</td></tr>
 <tr><td rowspan="4"><b>Code</b></td>
   <td>Data Leakage</td><td>Hardcoded secrets in XML, JSON, YAML, properties</td></tr>
@@ -158,12 +166,12 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 <tr><td>Debug Logging</td><td><code>Log.v/d</code>, Timber, <code>console.log</code>, <code>debugPrint</code> in production</td></tr>
 <tr><td>Broadcast Security</td><td><code>sendBroadcast()</code> without permission</td></tr>
 <tr><td rowspan="4"><b>UI / Input</b></td>
-  <td>FLAG_SECURE</td><td>Missing screenshot protection</td></tr>
+  <td>FLAG_SECURE</td><td>Informational review for sensitive screens</td></tr>
 <tr><td>Clipboard Exposure</td><td><code>ClipboardManager</code> without <code>FLAG_SENSITIVE</code></td></tr>
-<tr><td>Keyboard Cache</td><td>Missing <code>textPassword</code> / <code>textNoSuggestions</code></td></tr>
-<tr><td>Tapjacking</td><td>Missing <code>filterTouchesWhenObscured</code></td></tr>
+<tr><td>Keyboard Cache</td><td>Password input types and keyboard-learning hints</td></tr>
+<tr><td>Tapjacking</td><td>Informational review of sensitive confirmation views</td></tr>
 <tr><td rowspan="4"><b>Platform</b></td>
-  <td>SDK Version</td><td><code>minSdk</code> &lt; 23 or <code>targetSdk</code> &lt; 30</td></tr>
+  <td>SDK Version</td><td><code>minSdk</code> &lt; 23 or <code>targetSdk</code> &lt; 35</td></tr>
 <tr><td>PendingIntent</td><td>Missing <code>FLAG_IMMUTABLE</code> (Android 12+ hijacking)</td></tr>
 <tr><td>Task Hijacking</td><td>Custom <code>taskAffinity</code> — StrandHogg attack</td></tr>
 <tr><td>APK Signing</td><td>v1-only = Janus vulnerability (CVE-2017-13156). Checks v1/v2/v3/v4</td></tr>
@@ -172,21 +180,21 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 </details>
 
 <details>
-<summary><h2>🔑 Secret Detection (~40 Patterns)</h2></summary>
+<summary><h2>🔑 Secret Detection (34 Patterns)</h2></summary>
 
-Both **Storage Audit** and **Security Scan** use ~40 regex patterns to catch hardcoded secrets:
+Both **Storage Audit** and **Security Scan** use 34 high-signal regex patterns to catch hardcoded secrets. Public certificates, publishable Stripe keys, OAuth client IDs, and endpoint URLs are intentionally not classified as secrets.
 
 | Provider | Patterns |
 |----------|----------|
 | **Generic** | Passwords, API keys, tokens, JWTs, bearer tokens, encryption keys |
-| **AWS** | `AKIA` access keys, secret keys, session tokens, S3 URLs |
-| **Google / Firebase** | `AIza` keys, Firebase secrets, OAuth client IDs |
-| **Azure** | Storage keys, connection strings, tenant secrets |
-| **Stripe / Payment** | `sk_live_`, `pk_live_`, PayPal, Braintree, Razorpay |
+| **AWS** | `AKIA` access keys, secret keys, session tokens |
+| **Google / Firebase** | `AIza` keys, Firebase tokens and secrets |
+| **Azure** | Storage keys, connection strings, client secrets |
+| **Stripe / Payment** | `sk_live_`, `rk_live_`, PayPal, Braintree, Razorpay secrets |
 | **Messaging** | Twilio, SendGrid, Slack tokens, webhook URLs |
 | **GitHub** | `ghp_`/`ghs_` PATs, fine-grained tokens |
 | **Database** | MongoDB, Postgres, MySQL, Redis connection strings |
-| **Crypto** | PEM private keys, certificates |
+| **Crypto** | PEM private keys |
 
 </details>
 
@@ -289,7 +297,8 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 
 | Requirement | Required | Notes |
 |-------------|:--------:|-------|
-| Python 3.6+ | **Yes** | No pip packages needed |
+| Python 3.8+ | **Yes** | No pip packages needed; also required by the JAR launcher |
+| Java 8+ | JAR only | Not needed when running `python3 apkAnalyzer.py` directly |
 | ADB | **Yes** | Must be in PATH (checked at startup) |
 | Rooted device | **Yes** | Connected via USB; multiple devices supported |
 | `apktool` | **Yes** | [Install guide](https://ibotpeaches.github.io/Apktool/) |

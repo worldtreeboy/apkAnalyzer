@@ -8,3 +8,6 @@ patched_apks/
 backups/
 pulled_files/
 screenshots/
+dist/
+/frida-server
+/frida-server-*
