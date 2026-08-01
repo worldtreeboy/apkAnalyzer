@@ -17,5 +17,5 @@ jobs:
           python-version: "3.8"
       - name: Compile and test
         run: |
-          python -m py_compile apkAnalyzer.py tests/test_apk_analyzer.py
+          python -m py_compile apkAnalyzer.py tests/test_apk_analyzer.py tests/test_universal_bypass.py
           python -m unittest discover -s tests -v

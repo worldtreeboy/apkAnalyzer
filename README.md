@@ -192,7 +192,7 @@ Both **Storage Audit** and **Security Scan** use 34 high-signal regex patterns t
 <details>
 <summary><h2>🧬 Custom Frida Script (Universal Bypass)</h2></summary>
 
-`frida_scripts/universal_bypass.js` — a single all-in-one script that bypasses **SSL pinning**, **root detection**, and **runtime tampering** simultaneously. More comprehensive than any individual CodeShare script.
+`frida_scripts/universal_bypass.js` — a guarded all-in-one baseline for common **TLS pinning**, **root/emulator detection**, **anti-debug**, and **anti-Frida** checks. Spawn mode is recommended so hooks are installed before application code runs.
 
 ```bash
 frida -U -f <package> -l frida_scripts/universal_bypass.js
@@ -200,11 +200,13 @@ frida -U -f <package> -l frida_scripts/universal_bypass.js
 
 | Layer | What It Bypasses |
 |-------|-----------------|
-| **SSL Pinning** | TrustManager, TrustManagerFactory, HostnameVerifier, OkHttp3 CertificatePinner (+ proguarded), Conscrypt, TrustKit, WebView SSL, Flutter BoringSSL, Apache HTTP |
-| **Root Detection** | File.exists (30+ paths), PackageManager (20+ root packages), Runtime.exec, ProcessBuilder, Build.TAGS, SystemProperties, RootBeer library, native fopen/access/stat |
-| **Runtime Tampering** | Anti-Frida (port 27042, /proc/maps, native strstr), anti-debug (ptrace, TracerPid spoofing), System.exit blocking, emulator detection, Xposed detection, process kill prevention |
+| **TLS Pinning** | SSLContext/TrustManager, HostnameVerifier, OkHttp, Conscrypt, TrustKit, WebView SSL errors, plus exported OpenSSL/BoringSSL verification APIs in late-loaded modules |
+| **Root / Emulator** | Exact root/emulator files and packages, Runtime/ProcessBuilder commands, Build fields, SystemProperties, developer settings, RootBeer, and native file/command/property APIs |
+| **Runtime Tampering** | Frida port and tracked `/proc` probes, app-origin `strstr`/`fgets`/`readlink`, thread names, `ptrace`, Java debugger APIs, self-directed kill signals, and Java process termination |
 
-Every hook is wrapped in try/catch — if a class isn't present, it silently skips instead of crashing. Unique class names prevent collision on script reload.
+The script uses Frida 17's current module APIs with a Frida 16 fallback, watches newly loaded TLS modules, avoids hard-coded offsets and architecture-specific patches, and exposes hook/bypass counters through `rpc.exports.status`. Feature families can be disabled in the `CONFIG` block when isolating compatibility issues.
+
+No generic script can bypass server-side Play Integrity decisions, custom obfuscated RASP, or inlined/static native verification. Those checks need app-specific analysis and targeted hooks.
 
 </details>
 
