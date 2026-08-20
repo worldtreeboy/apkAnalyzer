@@ -64,7 +64,7 @@ class C:
 
 # ─── Report Collector ────────────────────────────────────────────────────────────
 
-TOOL_VERSION = "1.5.0"
+TOOL_VERSION = "1.6.0"
 
 MAX_XML_BYTES = 10 * 1024 * 1024
 MAX_BACKUP_BYTES = 512 * 1024 * 1024

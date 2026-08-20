@@ -8,6 +8,7 @@
 **One tool. One terminal. Zero Python packages.**
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Release](https://img.shields.io/github/v/release/worldtreeboy/apkAnalyzer?sort=semver)](https://github.com/worldtreeboy/apkAnalyzer/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL%20%7C%20macOS-lightgrey)]()
 [![ADB](https://img.shields.io/badge/Requires-ADB%20%2B%20Root-orange)]()
@@ -101,15 +102,15 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 
 <br>
 
-## 🆕 What's New in v1.5.0
+## 🆕 What's New in v1.6.0
 
-- 🐚 **Root shell repaired** — compound commands, quotes, pipes, arguments, and `cd` now survive the ADB → `su -c` boundary correctly on every host OS
-- 🛡️ **Safer untrusted input handling** — bounded Android-backup extraction, Windows/POSIX traversal protection, safe XML parsing, terminal-control filtering, and quoted manifest/database values
-- 🎯 **More accurate findings** — launcher activities, normal permissions, public IDs, empty caches, absent password layouts, debug-only CAs, and platform cleartext defaults no longer become false vulnerabilities
-- 🧠 **Stronger cache invalidation** — update time and code path now prevent same-version reinstalls or stale local APKs from contaminating scans
-- 🧬 **Reliable Frida patches** — Gadget is injected for the APK's actual ABIs, smali register allocation is valid, downloads are bounded, and the LSPatch JAR is SHA-256 pinned
-- 🔒 **Secret-safe output** — full regex matches are detected correctly and secret/PII values are redacted in findings and reports
-- ✅ **Regression suite** — command transport, manifest defaults, archive extraction, secret matching, and patcher injection are covered by automated tests
+- 🚦 **Failure-safe runtime analysis** — ADB, root, launch, and helper failures now produce explicit `INCONCLUSIVE` results instead of false passes or a misleading low-risk summary
+- 🎯 **Android-aware manifest results** — SDK defaults, permission inheritance and strength, aliases, provider path permissions, deep links, task affinity, and Network Security Config precedence are evaluated more accurately
+- 🔒 **Safer secret detection** — structured JSON, SharedPreferences XML, properties, source, smali, database URL, JWT, and PEM matching now redacts complete values while excluding known public identifiers
+- 📦 **Hardened backup extraction** — traversal, symlinked output paths, duplicate entries, file/directory conflicts, case collisions, oversized payloads, and malformed archives are rejected before member extraction
+- 🧠 **Trustworthy APK caching** — unverifiable caches are not reused, failed device pulls cannot fall back to stale local APKs, and local cache entries carry their own content identity
+- 🧬 **Safer Frida instrumentation** — Gadget loading uses a static class initializer without corrupting `onCreate` register frames, and the universal bypass script has been reworked for guarded modern Frida APIs
+- ✅ **Expanded regression coverage** — 67 tests cover failure states, manifest edge cases, archive confinement, secret redaction, cache provenance, and Gadget injection
 
 <br>
 
