@@ -49,8 +49,9 @@ class CliModuleTests(unittest.TestCase):
             output = Path(temp_dir, "nested", "report.sarif")
             returned = cli.export_report(collector, "sarif", output)
             data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(returned, os.path.abspath(output))
+            self.assertTrue(os.path.samefile(returned, output))
 
-        self.assertEqual(returned, str(output.resolve()))
         self.assertEqual(data["version"], "2.1.0")
         self.assertEqual(
             data["runs"][0]["results"][0]["ruleId"], "synthetic_issue"
@@ -63,8 +64,11 @@ class CliModuleTests(unittest.TestCase):
             with mock.patch(
                     "apk_analyzer.cli.shutil.which", return_value="/tools/java"):
                 command = cli.resolve_bundletool_command(jar)
+            self.assertEqual(
+                command, ["/tools/java", "-jar", os.path.abspath(jar)]
+            )
+            self.assertTrue(os.path.samefile(command[2], jar))
 
-        self.assertEqual(command, ["/tools/java", "-jar", str(jar.resolve())])
         self.assertNotIn(" ", command[0])
         self.assertIn(" ", command[2])
 

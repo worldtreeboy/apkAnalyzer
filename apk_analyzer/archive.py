@@ -16,6 +16,12 @@ DEFAULT_MAX_BACKUP_FILE_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_BACKUP_FILES = 100_000
 
 
+_DARWIN_TRUSTED_SYSTEM_ALIASES = {
+    "/tmp": "/private/tmp",
+    "/var": "/private/var",
+}
+
+
 def _is_link_or_reparse_point(path):
     """Return whether a path is a symlink, junction, or other reparse point."""
     try:
@@ -29,12 +35,36 @@ def _is_link_or_reparse_point(path):
     return bool(attributes & reparse_flag)
 
 
+def _is_trusted_darwin_system_alias(path):
+    """Return whether *path* is a known macOS root-level system alias.
+
+    Resolve only the immediate target of Apple's fixed aliases. Resolving the
+    whole output path would also hide caller-controlled symlink components.
+    """
+    if sys.platform != "darwin":
+        return False
+
+    alias = os.path.abspath(os.fspath(path))
+    expected_target = _DARWIN_TRUSTED_SYSTEM_ALIASES.get(alias)
+    if expected_target is None:
+        return False
+
+    try:
+        link_target = os.readlink(alias)
+    except OSError:
+        return False
+    if not os.path.isabs(link_target):
+        link_target = os.path.join(os.path.dirname(alias), link_target)
+    return os.path.abspath(link_target) == expected_target
+
+
 def find_symlinked_path_component(path):
     """Return a link/reparse point at or above *path*."""
     cursor = os.path.abspath(os.fspath(path))
     while True:
         if os.path.lexists(cursor) and _is_link_or_reparse_point(cursor):
-            return cursor
+            if not _is_trusted_darwin_system_alias(cursor):
+                return cursor
         parent = os.path.dirname(cursor)
         if parent == cursor:
             return None

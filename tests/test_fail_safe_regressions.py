@@ -215,8 +215,75 @@ class FailSafeRegressionTests(unittest.TestCase):
             with mock.patch.object(
                     archive_module.os, "lstat", side_effect=simulated_lstat):
                 found = archive_module.find_symlinked_path_component(target)
+            self.assertEqual(found, str(target.absolute()))
+            self.assertTrue(target.samefile(found))
 
-        self.assertEqual(found, str(target.resolve()))
+    def test_archive_path_check_allows_canonical_macos_system_aliases(self):
+        aliases = (
+            ("/var", "private/var", "/var/folders/zz/build/output"),
+            ("/tmp", "private/tmp", "/tmp/build/output"),
+        )
+
+        for alias, target, output in aliases:
+            with self.subTest(alias=alias), mock.patch.object(
+                archive_module.sys, "platform", "darwin"
+            ), mock.patch.object(
+                archive_module.os.path,
+                "lexists",
+                side_effect=lambda path: path == alias,
+            ), mock.patch.object(
+                archive_module,
+                "_is_link_or_reparse_point",
+                side_effect=lambda path: path == alias,
+            ), mock.patch.object(
+                archive_module.os, "readlink", return_value=target
+            ):
+                found = archive_module.find_symlinked_path_component(output)
+                self.assertIsNone(found)
+
+    def test_archive_path_check_rejects_counterfeit_macos_system_aliases(self):
+        aliases = (
+            ("/var", "/var/folders/zz/build/output"),
+            ("/tmp", "/tmp/build/output"),
+        )
+
+        for alias, output in aliases:
+            with self.subTest(alias=alias), mock.patch.object(
+                archive_module.sys, "platform", "darwin"
+            ), mock.patch.object(
+                archive_module.os.path,
+                "lexists",
+                side_effect=lambda path: path == alias,
+            ), mock.patch.object(
+                archive_module,
+                "_is_link_or_reparse_point",
+                side_effect=lambda path: path == alias,
+            ), mock.patch.object(
+                archive_module.os,
+                "readlink",
+                return_value="attacker-controlled",
+            ):
+                found = archive_module.find_symlinked_path_component(output)
+                self.assertEqual(found, alias)
+
+    def test_archive_path_check_rejects_user_symlink_below_macos_alias(self):
+        for alias in ("/var", "/tmp"):
+            malicious_ancestor = f"{alias}/user-link"
+            output = f"{malicious_ancestor}/output"
+
+            with self.subTest(alias=alias), mock.patch.object(
+                archive_module.sys, "platform", "darwin"
+            ), mock.patch.object(
+                archive_module.os.path,
+                "lexists",
+                side_effect=lambda path: path in (malicious_ancestor, alias),
+            ), mock.patch.object(
+                archive_module,
+                "_is_link_or_reparse_point",
+                side_effect=lambda path: path in (malicious_ancestor, alias),
+            ):
+                found = archive_module.find_symlinked_path_component(output)
+                self.assertEqual(found, malicious_ancestor)
 
     def test_unpack_ab_rejects_a_symlinked_output_ancestor(self):
         with tempfile.TemporaryDirectory() as tmp:
