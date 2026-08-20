@@ -94,6 +94,26 @@ class SecretScannerRegressionTests(unittest.TestCase):
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.synthetic_signature"
         self.assertEqual(analyzer._find_secret_matches(jwt), [jwt])
 
+    def test_azure_account_endpoint_without_key_is_not_a_secret(self):
+        public_config = (
+            "DefaultEndpointsProtocol=https;"
+            "AccountName=publicstorage;EndpointSuffix=core.windows.net"
+        )
+        assigned_public = f'azure_connection_string="{public_config}"'
+        self.assertEqual(analyzer._find_secret_matches(public_config), [])
+        self.assertEqual(analyzer._find_secret_matches(assigned_public), [])
+
+        credential = (
+            "DefaultEndpointsProtocol=https;AccountName=publicstorage;"
+            "AccountKey=synthetic-storage-secret-material;"
+            "EndpointSuffix=core.windows.net"
+        )
+        self.assertTrue(analyzer._find_secret_matches(credential))
+        self.assertNotIn(
+            "synthetic-storage-secret-material",
+            analyzer._redact_secret_text(credential),
+        )
+
     def test_database_url_rule_is_linear_on_colon_heavy_malformed_input(self):
         valid = "mongodb://sample-user:sample-pass@example.invalid/app"
         self.assertIn(valid, analyzer._find_secret_matches(valid))
@@ -133,6 +153,7 @@ class SecretScannerRegressionTests(unittest.TestCase):
             "AndroidManifest.xml",
             "classes.smali",
             "bundle.js",
+            "index.bundle",
             "environment.env",
             "private.pem",
         )
@@ -151,10 +172,8 @@ class SecretScannerRegressionTests(unittest.TestCase):
             self.assertFalse(analyzer._should_scan_static_secrets(unsupported))
 
             oversized = root / "oversized.smali"
-            oversized.write_bytes(
-                b"x" * (analyzer.STATIC_SECRET_MAX_FILE_BYTES + 1)
-            )
-            self.assertFalse(analyzer._should_scan_static_secrets(oversized))
+            oversized.write_bytes(b"x" * 500_001)
+            self.assertTrue(analyzer._should_scan_static_secrets(oversized))
 
 
 if __name__ == "__main__":

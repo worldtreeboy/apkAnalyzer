@@ -2,11 +2,18 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import apkAnalyzer as analyzer
+
+
+def _write_test_apk(path, marker=b"test-apk"):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("AndroidManifest.xml", b"binary-manifest")
+        archive.writestr("assets/marker.bin", marker)
 
 
 class DecompileCacheRegressionTests(unittest.TestCase):
@@ -65,8 +72,8 @@ class DecompileCacheRegressionTests(unittest.TestCase):
             ), mock.patch.object(
                 analyzer, "_find_apktool", return_value=["apktool"]
             ), mock.patch.object(
-                analyzer, "get_apk_path",
-                return_value="/data/app/com.example.updated-v2/base.apk"
+                analyzer, "get_apk_paths",
+                return_value=["/data/app/com.example.updated-v2/base.apk"]
             ), mock.patch.object(
                 analyzer, "adb_pull", return_value="[ERROR 1] device offline"
             ), mock.patch.object(
@@ -83,7 +90,7 @@ class DecompileCacheRegressionTests(unittest.TestCase):
                           output.getvalue())
             self.assertEqual(stale_apk.read_bytes(), b"stale-version-1")
             find_local.assert_not_called()
-            fingerprint.assert_not_called()
+            self.assertGreaterEqual(fingerprint.call_count, 1)
             run.assert_not_called()
 
     def test_local_fallback_cache_metadata_is_local_not_device_metadata(self):
@@ -96,7 +103,7 @@ class DecompileCacheRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             local_apk = Path(tmp, "extracted_apks", f"{package}.apk")
             local_apk.parent.mkdir()
-            local_apk.write_bytes(b"local-version-1")
+            _write_test_apk(local_apk, b"local-version-1")
 
             def fake_apktool(args, **_kwargs):
                 output_dir = Path(args[args.index("-o") + 1])
@@ -108,7 +115,7 @@ class DecompileCacheRegressionTests(unittest.TestCase):
             ), mock.patch.object(
                 analyzer, "_find_apktool", return_value=["apktool"]
             ), mock.patch.object(
-                analyzer, "get_apk_path", return_value=""
+                analyzer, "get_apk_paths", return_value=[]
             ), mock.patch.object(
                 analyzer, "_find_local_apk", return_value=str(local_apk)
             ), mock.patch.object(

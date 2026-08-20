@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import apkAnalyzer as analyzer
+from apk_analyzer import archive as archive_module
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -193,6 +194,30 @@ class FailSafeRegressionTests(unittest.TestCase):
             self.assertIn("symlink", error.lower())
             self.assertFalse((outside / relative).exists())
 
+    def test_archive_path_check_rejects_windows_reparse_points(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp, "junction")
+            target.mkdir()
+            real_lstat = archive_module.os.lstat
+            reparse_flag = getattr(
+                archive_module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+            )
+
+            def simulated_lstat(path):
+                result = real_lstat(path)
+                if Path(path) == target:
+                    result = mock.Mock(
+                        st_mode=result.st_mode,
+                        st_file_attributes=reparse_flag,
+                    )
+                return result
+
+            with mock.patch.object(
+                    archive_module.os, "lstat", side_effect=simulated_lstat):
+                found = archive_module.find_symlinked_path_component(target)
+
+        self.assertEqual(found, str(target.resolve()))
+
     def test_unpack_ab_rejects_a_symlinked_output_ancestor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -272,6 +297,54 @@ class FailSafeRegressionTests(unittest.TestCase):
             self.assertIn("duplicate", error.lower())
             self.assertFalse((output / "apps" / "x" / "f" / "A").exists())
 
+    def test_unpack_ab_rejects_unicode_normalization_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backup = root / "unicode.ab"
+            output = root / "output"
+            make_backup(
+                backup,
+                [("apps/x/f/\N{LATIN SMALL LETTER E WITH ACUTE}", "one"),
+                 ("apps/x/f/e\N{COMBINING ACUTE ACCENT}", "two")],
+            )
+
+            count, error = analyzer._unpack_ab(backup, output)
+
+            self.assertEqual(count, 0)
+            self.assertIn("duplicate", error.lower())
+            self.assertFalse((output / "apps" / "x" / "f").exists())
+
+    def test_unpack_ab_rolls_back_files_after_a_late_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backup = root / "write-error.ab"
+            output = root / "output"
+            make_backup(
+                backup,
+                [("apps/x/f/first", "one"), ("apps/x/f/second", "two")],
+            )
+            real_copy = archive_module.shutil.copyfileobj
+            calls = 0
+
+            def fail_second_copy(source, destination, length=0):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic disk failure")
+                return real_copy(source, destination, length=length)
+
+            with mock.patch(
+                "apk_analyzer.archive.shutil.copyfileobj",
+                side_effect=fail_second_copy,
+            ):
+                count, error = analyzer._unpack_ab(backup, output)
+
+            self.assertEqual(count, 0)
+            self.assertIn("synthetic disk failure", error)
+            self.assertFalse((output / "apps" / "x" / "f" / "first").exists())
+            self.assertFalse((output / "apps" / "x" / "f" / "second").exists())
+            self.assertFalse(output.exists())
+
     def test_runtime_helper_failure_is_not_converted_to_a_pass(self):
         output = io.StringIO()
 
@@ -339,6 +412,10 @@ class FailSafeRegressionTests(unittest.TestCase):
             commands.append(command)
             if command.startswith("pidof "):
                 return "123 456"
+            if command.startswith("ps -A -o PID,NAME"):
+                return ("PID NAME\n"
+                        "123 com.example.multi\n"
+                        "456 com.example.multi:remote")
             if "--pid=" in command:
                 return ""
             self.fail(f"unexpected command: {command}")

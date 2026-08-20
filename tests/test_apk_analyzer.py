@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -56,7 +57,8 @@ class CommandTests(unittest.TestCase):
             result = analyzer.adb_su('cd /data/local/tmp && printf "one two\\n"')
         self.assertEqual(result, "ok")
         args = run.call_args.args[0]
-        self.assertEqual(args[:4], ["adb", "-s", "serial-1", "shell"])
+        self.assertEqual(os.path.basename(args[0]), "adb")
+        self.assertEqual(args[1:4], ["-s", "serial-1", "shell"])
         self.assertEqual(
             args[4],
             "su -c 'cd /data/local/tmp && printf \"one two\\n\"'",
@@ -66,7 +68,9 @@ class CommandTests(unittest.TestCase):
         analyzer._root_mode = "adbd"
         with mock.patch.object(analyzer, "_run_cmd", return_value="ok") as run:
             analyzer.adb_su("pwd")
-        self.assertEqual(run.call_args.args[0], ["adb", "shell", "pwd"])
+        args = run.call_args.args[0]
+        self.assertEqual(os.path.basename(args[0]), "adb")
+        self.assertEqual(args[1:], ["shell", "pwd"])
 
     def test_run_cmd_surfaces_stderr_and_exit_status(self):
         completed = subprocess.CompletedProcess(

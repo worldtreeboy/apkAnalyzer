@@ -23,6 +23,60 @@ def write_manifest(root, body, uses_sdk=""):
 
 
 class ManifestAccuracyRegressionTests(unittest.TestCase):
+    def test_codenamed_or_oversized_sdk_values_are_inconclusive_and_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_manifest(
+                tmp,
+                '''<application android:debuggable="false"
+                    android:allowBackup="false"
+                    android:usesCleartextTraffic="false"/>''',
+                '<uses-sdk android:minSdkVersion="35" '
+                'android:targetSdkVersion="VanillaIceCream"/>',
+            )
+            parsed = analyzer._parse_manifest(tmp)
+            collector = analyzer.ReportCollector()
+            output = io.StringIO()
+            with mock.patch.object(
+                analyzer, "_pull_and_decompile", return_value=(tmp, tmp)
+            ), mock.patch.object(
+                analyzer, "_print_framework_info"
+            ), mock.patch.object(
+                analyzer, "detect_framework", return_value={}
+            ), mock.patch.object(
+                analyzer, "_find_local_apk", return_value=None
+            ), mock.patch.object(
+                analyzer, "_print_security_classes"
+            ), mock.patch.object(
+                analyzer, "_check_security_classes", return_value=[]
+            ), mock.patch.object(
+                analyzer, "_scan_native_strings", return_value=[]
+            ), mock.patch.object(analyzer, "pause"), mock.patch.object(
+                analyzer, "report", collector
+            ), redirect_stdout(output):
+                analyzer.security_scan("com.example.app")
+
+        self.assertEqual(parsed["target_sdk"], "VanillaIceCream")
+        self.assertTrue(any(
+            item["check_id"] == "manifest.sdk"
+            for item in collector.inconclusive
+        ))
+        self.assertIn("SDK policy", analyzer._terminal_safe(output.getvalue()))
+
+        oversized = "9" * 100_000
+        with tempfile.TemporaryDirectory() as tmp:
+            write_manifest(
+                tmp,
+                "<application/>",
+                f'<uses-sdk android:minSdkVersion="35" '
+                f'android:targetSdkVersion="{oversized}"/>',
+            )
+            parsed = analyzer._parse_manifest(tmp)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertLessEqual(len(parsed["target_sdk"]), 80)
+        self.assertTrue(parsed["sdk_issues"])
+        self.assertIsNone(analyzer._parse_sdk_level(oversized))
+
     def test_omitted_sdk_values_use_android_platform_defaults(self):
         cases = (
             ("", "1", "1"),
@@ -154,7 +208,7 @@ class ManifestAccuracyRegressionTests(unittest.TestCase):
             analyzer._provider_is_strongly_protected(parsed, provider)
         )
 
-    def test_deeplinks_require_exported_view_and_browsable_same_filter(self):
+    def test_deeplinks_require_exported_view_browsable_and_default_same_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_manifest(
                 tmp,
@@ -164,6 +218,7 @@ class ManifestAccuracyRegressionTests(unittest.TestCase):
     <intent-filter>
       <action android:name="android.intent.action.VIEW"/>
       <category android:name="android.intent.category.BROWSABLE"/>
+      <category android:name="android.intent.category.DEFAULT"/>
       <data android:scheme="https"/>
       <data android:scheme="valid" android:host="valid.example"/>
     </intent-filter>

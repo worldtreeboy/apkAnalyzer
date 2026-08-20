@@ -9,13 +9,28 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.8"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.8"
+          python-version: ${{ matrix.python }}
       - name: Compile and test
         run: |
-          python -m py_compile apkAnalyzer.py tests/test_apk_analyzer.py tests/test_universal_bypass.py
+          python -m compileall -q apkAnalyzer.py apk_analyzer tests
+          python apkAnalyzer.py --help
+          python apkAnalyzer.py scan --help
           python -m unittest discover -s tests -v
+          node --check frida_scripts/universal_bypass.js

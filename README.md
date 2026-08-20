@@ -11,7 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/worldtreeboy/apkAnalyzer?sort=semver)](https://github.com/worldtreeboy/apkAnalyzer/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL%20%7C%20macOS-lightgrey)]()
-[![ADB](https://img.shields.io/badge/Requires-ADB%20%2B%20Root-orange)]()
+[![Mode](https://img.shields.io/badge/Mode-Local%20CI%20%7C%20ADB%20Device-orange)]()
 [![Frida](https://img.shields.io/badge/Frida-Integrated-blueviolet?logo=frida)](https://frida.re)
 
 <br>
@@ -22,15 +22,32 @@
 
 <br>
 
-## 🚀 Get Started in 10 Seconds
+## 🚀 Get Started
 
 ```bash
 git clone https://github.com/worldtreeboy/apkAnalyzer.git
 cd apkAnalyzer
+python3 apkAnalyzer.py scan --apk app.apk --format sarif --output report.sarif --fail-on high
+```
+
+Local static scans need Python 3.8+ and apktool, but do **not** need ADB, root,
+or a connected device. The command accepts a single `.apk`, an `.apks` set, an
+`.aab` (with bundletool), or a directory containing split APKs.
+
+Release downloads provide `apkAnalyzer-v1.7.0.zip` and its SHA-256 checksum.
+Extract the complete ZIP: the launcher now depends on the included
+`apk_analyzer/` package and is no longer a standalone single-file script.
+
+For the interactive device workflow:
+
+```bash
 python3 apkAnalyzer.py
 ```
 
-> **That's it.** No `pip install`, Docker, or config files. Install ADB (plus apktool for static scans), connect a rooted device, and go.
+No Python packages, Docker, or config files are required. Keep
+`apkAnalyzer.py` beside the included `apk_analyzer/` directory. Device-only
+features require ADB; privileged storage and instrumentation features may also
+require root or Frida.
 
 <br>
 
@@ -99,18 +116,21 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 🔌 | **Multi-device support** — pick a device when several are connected, all commands follow |
 | 🔎 | **Structured secret detection** — scans common Android source/config formats while excluding known public identifiers |
 | 🤖 | **Framework-aware** — auto-detects Flutter, React Native, Kotlin and adjusts scans |
+| 🧾 | **CI-ready reports** — JSON, self-contained HTML, and SARIF with stable rule IDs and explicit incomplete coverage |
 
 <br>
 
-## 🆕 What's New in v1.6.0
+## 🆕 What's New in v1.7.0
 
-- 🚦 **Failure-safe runtime analysis** — ADB, root, launch, and helper failures now produce explicit `INCONCLUSIVE` results instead of false passes or a misleading low-risk summary
-- 🎯 **Android-aware manifest results** — SDK defaults, permission inheritance and strength, aliases, provider path permissions, deep links, task affinity, and Network Security Config precedence are evaluated more accurately
-- 🔒 **Safer secret detection** — structured JSON, SharedPreferences XML, properties, source, smali, database URL, JWT, and PEM matching now redacts complete values while excluding known public identifiers
-- 📦 **Hardened backup extraction** — traversal, symlinked output paths, duplicate entries, file/directory conflicts, case collisions, oversized payloads, and malformed archives are rejected before member extraction
-- 🧠 **Trustworthy APK caching** — unverifiable caches are not reused, failed device pulls cannot fall back to stale local APKs, and local cache entries carry their own content identity
-- 🧬 **Safer Frida instrumentation** — Gadget loading uses a static class initializer without corrupting `onCreate` register frames, and the universal bypass script has been reworked for guarded modern Frida APIs
-- ✅ **Expanded regression coverage** — 67 tests cover failure states, manifest edge cases, archive confinement, secret redaction, cache provenance, and Gadget injection
+- 🧰 **Headless local and CI scanning** — analyze `.apk`, `.apks`, `.aab`, or split-APK directories without ADB; export JSON, HTML, or SARIF and enforce a severity threshold with `--fail-on`
+- 🧩 **Compatibility-preserving modules** — the launcher remains `apkAnalyzer.py`, while archive, input, process, reporting, resource, secret, and rule logic now lives in testable `apk_analyzer/` modules
+- 📚 **Complete split acquisition** — installed split APK sets are pulled, fingerprinted, and decompiled atomically instead of silently analyzing only `base.apk`; single-APK patchers refuse split installs they cannot safely rebuild
+- 📦 **APK and bundle preflight** — ZIP traversal, symlinks, junctions, duplicates, path-prefix/case/Unicode collisions, invalid CRCs, excessive expansion, and unsafe Windows names are rejected before apktool runs
+- 📸 **Immutable local-input snapshots** — validated APK, APK Set, and App Bundle bytes are copied into private staging before external tools run, preventing concurrent file replacement from bypassing preflight
+- 🎯 **More accurate Android rules** — resource-backed booleans, version-qualified resources, permission inheritance, provider path permissions, PendingIntent flags, clipboard sensitivity, and reachable deep links are evaluated with explicit unknown states
+- 🔒 **Bounded secret and code coverage** — React Native bundles and large source trees are scanned in chunks; unreadable, skipped, or budget-limited evidence produces `INCONCLUSIVE`, never a clean pass
+- 📄 **Stable automation output** — report schema 2.0 adds stable rule IDs, locations, coverage metadata, atomic writes, SARIF 2.1.0, and deterministic CI exit codes
+- 🖥️ **Broader compatibility checks** — CI covers Python 3.8 and 3.13 plus launcher/import behavior on Ubuntu, Windows, and macOS
 
 <br>
 
@@ -119,10 +139,13 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 - **Failure-safe runtime results** — missing, offline, unauthorized, or disconnected devices and failed root/tool commands are reported as `INCONCLUSIVE`; unavailable evidence is never converted into a pass or a low-risk result
 - **Manifest-aware classification** — omitted SDK defaults, explicit empty permissions, activity aliases, provider path permissions, effective task affinity, and enabled/exported deep-link filters are handled explicitly
 - **Effective network policy** — Android version defaults (including Android 6) and Network Security Config precedence are considered when evaluating cleartext traffic
-- **Bounded secret scanning** — JSON, SharedPreferences XML, properties, source, smali, and other common text formats are scanned up to 500 KB per file; values are redacted in terminal and report output
+- **Bounded secret scanning** — JSON, SharedPreferences XML, properties, source, smali, JavaScript, and React Native bundles are scanned incrementally up to 32 MiB per file and 256 MiB per scan, with overlap across chunk boundaries
+- **Bounded code scanning** — smali/XML signal scans use a 16 MiB per-file and 512 MiB total budget; partial, unreadable, skipped, or analysis-limited files make affected absence claims inconclusive
+- **Bounded native analysis** — native strings inspect at most 256 libraries and 512 MiB per scan within a 120-second global deadline (with per-file/output limits); unscanned libraries are recorded as incomplete coverage
+- **Stable local evidence** — local APK, APK Set, App Bundle, and split-directory inputs are analyzed from private staged snapshots tied to the bytes that passed archive preflight
 - **Public identifiers stay informational** — Firebase/Google Android API keys, AWS access-key IDs, and Twilio Account/API-key SIDs are not reported as credentials by themselves
 - **Safer backup extraction** — symlink output roots, duplicate members, file/directory prefix conflicts, traversal paths, and destination-filesystem case collisions are rejected before any archive member is written
-- **Safer cache and Gadget behavior** — decompile caches are not reused when device fingerprints cannot be verified, and Frida Gadget loading is injected through `<clinit>` without changing an activity's `onCreate` register frame
+- **Safer cache and Gadget behavior** — device identity and a full decoded-tree integrity seal are verified before cache reuse, and Frida Gadget loading is injected through `<clinit>` without changing an activity's `onCreate` register frame
 
 `PASS` means a check ran with the evidence it required. `INCONCLUSIVE` means the required device, manifest, command, or tool evidence was unavailable. Neither status proves that an application is free of vulnerabilities.
 
@@ -144,7 +167,7 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 10 | **Frida Server** | USB/remote mode switching, port forwarding, auto server management |
 | 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder, **adb backup extraction** |
 | 12 | **Runtime Security Check** | ADB-based dynamic analysis with explicit inconclusive states: post-launch secret scanning, file permissions, exported component probing, clipboard/logcat leakage, WebView cache |
-| r | **Report Export** | Export findings to JSON or HTML with severity badges, MASVS references, and CWE IDs (`--report json\|html`) |
+| r | **Report Export** | Export interactive results to JSON/HTML, or use the headless `scan` command for JSON/HTML/SARIF and severity exit codes |
 
 <br>
 
@@ -165,7 +188,7 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 <tr><td rowspan="3"><b>Network</b></td>
   <td>Cleartext Traffic</td><td>Effective manifest, target-SDK, and network-config policy allows HTTP</td></tr>
 <tr><td>Network Security Config</td><td>Production policy trusts user-installed CAs</td></tr>
-<tr><td>Deeplinks</td><td>Custom URI schemes without validation</td></tr>
+<tr><td>Deeplinks</td><td>Reachable custom, unverified, or broadly scoped links; constrained verified HTTPS App Links remain informational</td></tr>
 <tr><td rowspan="4"><b>Code</b></td>
   <td>Data Leakage</td><td>Hardcoded secrets in bounded XML, JSON, properties, environment, source, smali, and related text files</td></tr>
 <tr><td>WebView JS Interface</td><td><code>addJavascriptInterface()</code> — XSS risk on SDK &lt; 17</td></tr>
@@ -173,12 +196,12 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 <tr><td>Broadcast Security</td><td><code>sendBroadcast()</code> without permission</td></tr>
 <tr><td rowspan="4"><b>UI / Input</b></td>
   <td>FLAG_SECURE</td><td>Informational review for sensitive screens</td></tr>
-<tr><td>Clipboard Exposure</td><td>Clipboard reads and writes that require manual exposure review</td></tr>
+<tr><td>Clipboard Exposure</td><td>Clipboard writes not marked with <code>ClipDescription.EXTRA_IS_SENSITIVE=true</code>; read-only access is not treated as a leak by itself</td></tr>
 <tr><td>Keyboard Cache</td><td>Password input types and keyboard-learning hints</td></tr>
 <tr><td>Tapjacking</td><td>Informational review of sensitive confirmation views</td></tr>
 <tr><td rowspan="4"><b>Platform</b></td>
   <td>SDK Version</td><td><code>minSdk</code> &lt; 23 or <code>targetSdk</code> &lt; 35</td></tr>
-<tr><td>PendingIntent</td><td>Missing <code>FLAG_IMMUTABLE</code> (Android 12+ hijacking)</td></tr>
+<tr><td>PendingIntent</td><td>Per-invocation flag and intent analysis; mutable implicit intents are flagged and dynamic/unknown flags are inconclusive</td></tr>
 <tr><td>Task Hijacking</td><td>Custom <code>taskAffinity</code> — StrandHogg attack</td></tr>
 <tr><td>APK Signing</td><td>v1-only = Janus vulnerability (CVE-2017-13156). Checks v1/v2/v3/v4</td></tr>
 </table>
@@ -268,6 +291,12 @@ Check java → Download LSPatch → Get APK → Patch
 → Output: patched_apks/
 ```
 
+Both patchers deliberately stop before making changes when the installed app
+uses split APKs. Rebuilding, re-signing, and reinstalling only `base.apk` would
+produce an incomplete or signature-mismatched app. Frida Gadget output is
+verified after signing, and LSPatch completion is reported only when a new,
+non-empty APK is actually produced.
+
 </details>
 
 <details>
@@ -288,16 +317,42 @@ Native security SDKs (VKey, Zimperium, Promon, DexGuard) are detected from `.so`
 
 ---
 
-## 📊 Report Export
+## 📊 Headless Scans and Reports
 
-Export findings to JSON or self-contained HTML reports with severity badges, MASVS references, and CWE IDs:
+Use the `scan` subcommand for local files and CI. It performs archive preflight,
+decompiles in an isolated temporary directory, runs the static checks, writes
+the report atomically, and cleans temporary files:
+
+```bash
+python3 apkAnalyzer.py scan --apk app.apk --format json --output findings.json
+python3 apkAnalyzer.py scan --apk app.apks --format html --output report.html
+python3 apkAnalyzer.py scan --apk split-directory --format sarif --output results.sarif --fail-on high
+python3 apkAnalyzer.py scan --apk app.aab --bundletool /path/to/bundletool.jar --format sarif --output results.sarif
+```
+
+If `--output` is omitted, a collision-resistant timestamped report is created
+in the current directory. `--fail-on` accepts `critical`, `high`, `medium`,
+`low`, `info`, or `none`.
+
+| Exit code | Meaning |
+|:---------:|---------|
+| `0` | Scan completed and no finding met the selected threshold |
+| `1` | Scan completed and at least one finding met the threshold |
+| `2` | Setup, parsing, tool, signing, split, or scan coverage was incomplete |
+
+Exit code `2` takes precedence over finding thresholds so missing evidence can
+never look like a clean CI result. Reports use schema 2.0 and include stable
+rule IDs, severity/confidence, locations when available, and explicit coverage
+records. SARIF output uses SARIF 2.1.0.
+
+The interactive workflow still supports:
 
 ```bash
 python3 apkAnalyzer.py --report html --output report.html
 python3 apkAnalyzer.py --report json --output findings.json
 ```
 
-Or use the `[r] Export Report` menu option during an interactive session. HTML reports include color-coded severity badges, device info, and a findings summary table.
+You can also use `[r] Export Report` during an interactive session.
 
 ---
 
@@ -306,10 +361,11 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 | Requirement | Required | Notes |
 |-------------|:--------:|-------|
 | Python 3.8+ | **Yes** | No pip packages needed |
-| ADB | **Yes** | Must be in PATH (checked at startup) |
-| Rooted device | **Yes** | Connected via USB; multiple devices supported |
-| `apktool` | **Yes** | [Install guide](https://ibotpeaches.github.io/Apktool/) |
-| `apksigner` | Optional | For APK signing scheme check |
+| `apktool` | **Static scans** | Required for local and device static analysis; [install guide](https://ibotpeaches.github.io/Apktool/) |
+| `apksigner` | **Complete static coverage** | Without it, signing verification is explicitly `INCONCLUSIVE` and headless scans exit `2` |
+| ADB | Device mode only | Not used by the local `scan` subcommand |
+| Rooted device | Some device features | Storage/shell/runtime capabilities degrade explicitly when root is unavailable |
+| bundletool + Java | `.aab` input only | Pass a native executable or JAR with `--bundletool`; generated signing is not attributed to the AAB, and potentially omitted non-fused/on-demand feature modules are reported as incomplete coverage |
 | `frida` + `frida-tools` | Optional | For Frida scripts |
 | `strings` (binutils) | Optional | Native lib string scan; pure-Python fallback included |
 
@@ -325,6 +381,32 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 ./.gadget_cache/       ← Cached Frida Gadget & LSPatch jar
 ./.apkanalyzer_tmp/    ← Decompiled APK cache (reused across scans)
 ```
+
+## 🧩 Code Structure
+
+`apkAnalyzer.py` remains the executable and backward-compatible import surface,
+so existing commands and integrations continue to work. Reusable implementation
+code is being moved gradually into the `apk_analyzer/` package:
+
+| Module | Responsibility |
+|--------|----------------|
+| `apk_analyzer/safety.py` | Package-name validation, bounded XML parsing, and terminal-output sanitizing |
+| `apk_analyzer/process.py` | Bounded subprocess execution and explicit unavailable-result handling |
+| `apk_analyzer/ui.py` | Terminal colors and presentation helpers |
+| `apk_analyzer/reporting.py` | Finding collection plus JSON, HTML, and SARIF rendering |
+| `apk_analyzer/archive.py` | Confined, bounded Android backup extraction |
+| `apk_analyzer/inputs.py` | Safe APK/APKS/AAB preparation and atomic split-aware decompilation |
+| `apk_analyzer/cli.py` | Headless exit policy, report dispatch, and bundletool resolution |
+| `apk_analyzer/resources.py` | Android boolean and version-qualified XML resource resolution |
+| `apk_analyzer/secrets.py` | Chunked, bounded, symlink-safe secret-file traversal |
+| `apk_analyzer/code_scan.py` | Chunked, bounded smali/XML signal traversal and coverage state |
+| `apk_analyzer/static_rules.py` | PendingIntent, clipboard, and deep-link classifiers |
+| `apk_analyzer/version.py` | Shared version metadata |
+
+The package name contains an underscore deliberately: it stays distinct from
+`apkAnalyzer.py` on case-insensitive Windows and macOS filesystems. A source or
+release copy must include both the launcher and the `apk_analyzer/` directory;
+copying only `apkAnalyzer.py` is no longer sufficient.
 
 ---
 
@@ -347,6 +429,15 @@ The suite uses deterministic ADB/tool mocks and temporary APK/backup fixtures, s
 ```bash
 node --check frida_scripts/universal_bypass.js
 ```
+
+To compile-check the launcher and every extracted module explicitly:
+
+```bash
+python -m compileall -q apkAnalyzer.py apk_analyzer tests
+```
+
+CI runs the minimum supported Python 3.8 environment and Python 3.13, with
+launcher/import smoke coverage on Ubuntu, Windows, and macOS.
 
 ---
 
