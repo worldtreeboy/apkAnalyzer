@@ -230,7 +230,7 @@ Both **Storage Audit** and **Security Scan** use structured, bounded matching ru
 <details>
 <summary><h2>🧬 Custom Frida Script (Universal Bypass)</h2></summary>
 
-`frida_scripts/universal_bypass.js` — a guarded all-in-one baseline for common **TLS pinning**, **root/emulator detection**, **anti-debug**, and **anti-Frida** checks. Spawn mode is recommended so hooks are installed before application code runs.
+`frida_scripts/universal_bypass.js` (v2.1.0) — a guarded all-in-one baseline for common **TLS pinning**, **root/emulator detection**, **anti-debug**, and **anti-Frida** checks. Spawn mode is recommended so hooks are installed before application code runs.
 
 ```bash
 frida -U -f <package> -l frida_scripts/universal_bypass.js
@@ -240,11 +240,11 @@ frida -U -f <package> -l frida_scripts/universal_bypass.js
 |-------|-----------------|
 | **TLS Pinning** | SSLContext/TrustManager, HostnameVerifier, OkHttp, Conscrypt, TrustKit, WebView SSL errors, plus exported OpenSSL/BoringSSL verification APIs in late-loaded modules |
 | **Root / Emulator** | Exact root/emulator files and packages, Runtime/ProcessBuilder commands, Build fields, SystemProperties, developer settings, RootBeer, and native file/command/property APIs |
-| **Runtime Tampering** | Frida port and tracked `/proc` probes, app-origin `strstr`/`fgets`/`readlink`, thread names, `ptrace`, Java debugger APIs, self-directed kill signals, and Java process termination |
+| **Runtime Tampering** | App-origin Frida-port, tracked `/proc`, string, readlink, and thread-name probes; `ptrace`; Java debugger APIs; self-directed SIGABRT/SIGKILL/SIGTERM requests; and Java process termination |
 
-The script uses Frida 17's current module APIs with a Frida 16 fallback, watches newly loaded TLS modules, avoids hard-coded offsets and architecture-specific patches, and exposes hook/bypass counters through `rpc.exports.status`. Feature families can be disabled in the `CONFIG` block when isolating compatibility issues.
+The script uses Frida 17's current module APIs with a Frida 16 fallback, watches newly loaded TLS modules, avoids hard-coded offsets and architecture-specific patches, and bounds native string and `/proc` processing. APK-controlled log text is length-limited and terminal controls are escaped. `rpc.exports.status()` reports native/Java readiness, hook counts, bypass counts, and setup errors; feature families can be disabled in the `CONFIG` block when isolating compatibility issues.
 
-No generic script can bypass server-side Play Integrity decisions, custom obfuscated RASP, or inlined/static native verification. Those checks need app-specific analysis and targeted hooks.
+No generic script can bypass server-side Play Integrity decisions, custom obfuscated RASP, inlined/static native verification, or every class loaded later through a private `DexClassLoader`. Those checks need app-specific analysis and targeted hooks.
 
 </details>
 
