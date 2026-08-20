@@ -93,11 +93,19 @@ def _redact(value, visible=4):
     text = _terminal_safe(value).strip()
     if not text:
         return ""
+    # When the value itself is a scanner match, preserve its key/formatting but
+    # never expose fragments of the matched credential.  The helper is defined
+    # later in the module, so use a guarded lookup during module initialization.
+    secret_redactor = globals().get("_redact_secret_text")
+    if secret_redactor is not None:
+        redacted = secret_redactor(text)
+        if redacted != text:
+            return redacted
     # Keep a useful key/label visible for key=value style findings.
-    match = re.match(r"(?s)(.*?\s*[=:]\s*)(\S+)(.*)", text)
+    match = re.match(r"(?s)(.*?\s*[=:]\s*)(.*)", text)
     if match:
-        prefix, secret, suffix = match.groups()
-        return prefix + _redact(secret, visible) + suffix
+        prefix, secret = match.groups()
+        return prefix + ("[REDACTED]" if secret else "")
     if len(text) <= visible * 2:
         return "*" * len(text)
     return f"{text[:visible]}…{text[-visible:]}"
@@ -387,6 +395,56 @@ def _is_err(out):
     """True if a command output is empty or an error sentinel like [ERROR]/[TIMEOUT]."""
     return (not out or out == "[TIMEOUT]" or out.startswith("[ERROR"))
 
+
+def _command_failed(out):
+    """Return whether a command produced one of ``_run_cmd``'s failure sentinels.
+
+    Unlike :func:`_is_err`, an empty string is not necessarily a failure: many
+    successful shell probes intentionally produce no output when they find
+    nothing. Runtime checks use this narrower predicate so they can distinguish
+    a clean empty result from an unavailable device or failed command.
+    """
+    return isinstance(out, str) and (
+        out == "[TIMEOUT]" or out.startswith("[ERROR")
+    )
+
+
+class RuntimeCheckUnavailable(RuntimeError):
+    """Raised when a runtime security check cannot obtain trustworthy data."""
+
+    def __init__(self, message, partial_findings=None):
+        super().__init__(message)
+        self.partial_findings = list(partial_findings or [])
+
+
+def _require_runtime_command(out, operation, require_output=False,
+                             partial_findings=None):
+    """Validate command output or raise an explicit inconclusive-check error."""
+    if _command_failed(out) or (require_output and not str(out or "").strip()):
+        detail = str(out or "no output").strip()
+        raise RuntimeCheckUnavailable(
+            f"{operation}: {detail}", partial_findings=partial_findings
+        )
+    return out
+
+
+def _require_app_launch(out, operation="launching target app"):
+    """Reject both transport errors and monkey/am textual launch failures."""
+    _require_runtime_command(out, operation, require_output=True)
+    lowered = str(out or "").lower()
+    failure_markers = (
+        "no activities found", "monkey aborted", "unable to resolve intent",
+        "activity class does not exist", "error type 3",
+    )
+    if any(marker in lowered for marker in failure_markers):
+        raise RuntimeCheckUnavailable(f"{operation}: {str(out).strip()}")
+    injected = re.search(r"Events injected:\s*(\d+)", str(out), re.IGNORECASE)
+    if injected is None or int(injected.group(1)) < 1:
+        raise RuntimeCheckUnavailable(
+            f"{operation}: monkey did not confirm an injected launch event"
+        )
+    return out
+
 def adb_su(cmd, timeout=30):
     """Run command as root, auto-detecting whether su or adbd-root is available."""
     if _root_mode == "adbd":
@@ -399,20 +457,30 @@ def adb_su(cmd, timeout=30):
 
 def adb_pull(remote, local):
     """Atomically pull a file from the device, never accepting stale output."""
-    partial = os.path.abspath(local) + ".part"
+    local_path = os.path.abspath(os.fspath(local))
+    local_dir = os.path.dirname(local_path)
+    partial = None
     try:
-        if os.path.exists(partial):
-            os.remove(partial)
+        fd, partial = tempfile.mkstemp(
+            prefix=os.path.basename(local_path) + ".",
+            suffix=".part",
+            dir=local_dir,
+        )
+        os.close(fd)
+        # Reserve a collision-resistant name, then remove the placeholder so
+        # success still requires adb itself to create the pulled file.
+        os.remove(partial)
         result = _run_cmd(_adb_base() + ["pull", remote, partial], timeout=120)
         failed = result == "[TIMEOUT]" or result.startswith("[ERROR")
         if failed or not os.path.isfile(partial):
             return result if failed else "[ERROR] adb pull produced no file"
-        os.replace(partial, local)
+        os.replace(partial, local_path)
+        partial = None
         return result or "pulled"
     except OSError as e:
         return f"[ERROR] {e}"
     finally:
-        if os.path.exists(partial):
+        if partial and os.path.exists(partial):
             os.remove(partial)
 
 
@@ -654,8 +722,13 @@ def _pull_and_decompile(pkg):
         if not isinstance(cached_meta, dict):
             cached_meta = {}
         current_meta = _get_package_fingerprint(pkg)
-        cache_matches = bool(current_meta and cached_meta == current_meta)
-        if current_meta and not cache_matches:
+        if not current_meta:
+            # A transient ADB/device failure must not turn an old decompile into
+            # trusted input. Preserve the cache so a later, healthy connection
+            # can verify it, but stop this scan as inconclusive.
+            print(f"  {C.YELLOW}[!] Could not verify the cached decompile against the installed app; cache was not used.{C.RST}")
+            return None, None
+        if cached_meta != current_meta:
             old_vc = cached_meta.get("versionCode", "unknown")
             new_vc = current_meta.get("versionCode", "unknown")
             print(f"  {C.YELLOW}[!] App changed on device (versionCode {old_vc} → {new_vc}) — re-decompiling.{C.RST}")
@@ -676,16 +749,19 @@ def _pull_and_decompile(pkg):
     # Prefer the installed APK so scans cannot silently use a stale local copy.
     apk_path = get_apk_path(pkg)
     local_apk = None
+    apk_source = "local"
     if apk_path:
         local_apk = os.path.join(work_dir, f"{pkg}.apk")
         print(f"  {C.DIM}Pulling APK from device...{C.RST}")
         pull_result = adb_pull(apk_path, local_apk)
         if _is_err(pull_result) or not os.path.exists(local_apk):
-            local_apk = None
-    if not local_apk:
+            print(f"  {C.RED}[!] Installed APK was located but could not be pulled; refusing to use an unverified local fallback: {pull_result}{C.RST}")
+            return None, None
+        apk_source = "device"
+    else:
         local_apk = _find_local_apk(pkg)
         if local_apk:
-            print(f"  {C.YELLOW}[!] Device pull unavailable; using local APK: {local_apk}{C.RST}")
+            print(f"  {C.YELLOW}[!] Installed APK path unavailable; using unverified local APK: {local_apk}{C.RST}")
         else:
             print(f"  {C.RED}[!] Could not locate APK on device or locally.{C.RST}")
             return None, None
@@ -707,11 +783,20 @@ def _pull_and_decompile(pkg):
         print(f"  {C.RED}[!] Could not start apktool: {e}{C.RST}")
         return None, None
 
-    # Remember the app version this decompile belongs to (for cache invalidation)
+    # Only a successfully pulled APK may inherit installed-package metadata.
+    # Local fallback content gets an explicitly local identity so it can never
+    # masquerade as the currently installed build on a later cache check.
     try:
+        if apk_source == "device":
+            decompile_meta = _get_package_fingerprint(pkg)
+        else:
+            decompile_meta = {
+                "source": "local",
+                "sha256": _file_sha256(local_apk),
+            }
         with open(os.path.join(decompiled_dir, ".apkanalyzer_meta.json"),
                   "w", encoding="utf-8") as f:
-            json.dump(_get_package_fingerprint(pkg), f, indent=2)
+            json.dump(decompile_meta, f, indent=2)
     except Exception:
         pass
 
@@ -977,6 +1062,92 @@ DANGEROUS_PERMS = {
     "android.permission.NEARBY_WIFI_DEVICES", "android.permission.POST_NOTIFICATIONS",
 }
 
+
+_STRONG_PERMISSION_LEVELS = {
+    "signature", "signatureOrSystem", "knownSigner", "internal",
+}
+
+_KNOWN_STRONG_PLATFORM_PERMISSIONS = {
+    # Representative framework permissions commonly used to protect exported
+    # service entry points. Their protection level is defined by Android, not
+    # by the application manifest being scanned.
+    "android.permission.BIND_ACCESSIBILITY_SERVICE",
+    "android.permission.BIND_AUTOFILL_SERVICE",
+    "android.permission.BIND_CARRIER_MESSAGING_SERVICE",
+    "android.permission.BIND_DEVICE_ADMIN",
+    "android.permission.BIND_INCALL_SERVICE",
+    "android.permission.BIND_INPUT_METHOD",
+    "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE",
+    "android.permission.BIND_PRINT_SERVICE",
+    "android.permission.BIND_QUICK_SETTINGS_TILE",
+    "android.permission.BIND_TELECOM_CONNECTION_SERVICE",
+    "android.permission.BIND_VPN_SERVICE",
+    "android.permission.BIND_WALLPAPER",
+}
+
+_KNOWN_WEAK_PLATFORM_PERMISSIONS = DANGEROUS_PERMS | {
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE",
+    "android.permission.BLUETOOTH",
+    "android.permission.BLUETOOTH_ADMIN",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.NFC",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.VIBRATE",
+    "android.permission.WAKE_LOCK",
+}
+
+
+def _permission_strength(manifest, permission):
+    """Return ``strong``, ``weak``, or ``unknown`` for a gate permission."""
+    if not permission:
+        return "weak"
+    level = manifest["declared_permissions"].get(permission)
+    if level is not None:
+        base_levels = {part.strip() for part in level.split("|")}
+        return ("strong" if base_levels & _STRONG_PERMISSION_LEVELS
+                else "weak")
+    if permission in _KNOWN_STRONG_PLATFORM_PERMISSIONS:
+        return "strong"
+    if permission in _KNOWN_WEAK_PLATFORM_PERMISSIONS:
+        return "weak"
+    return "unknown"
+
+
+def _permission_is_strong(manifest, permission):
+    """Return whether this manifest proves that *permission* is strong.
+
+    A permission that is not declared in the analyzed manifest has an unknown
+    protection level.  Treating every such name as signature-level hides
+    components guarded by normal platform permissions such as INTERNET.
+    """
+    return _permission_strength(manifest, permission) == "strong"
+
+
+def _provider_protection_strength(manifest, provider):
+    """Return the weakest effective provider/path permission strength."""
+    strengths = [
+        _permission_strength(manifest, provider.get("read_perm")),
+        _permission_strength(manifest, provider.get("write_perm")),
+    ]
+    for path_permission in provider.get("path_permissions", []):
+        for key in ("read_perm", "write_perm"):
+            permission = path_permission.get(key)
+            if permission is not None:
+                strengths.append(_permission_strength(manifest, permission))
+    if "weak" in strengths:
+        return "weak"
+    if strengths and all(strength == "strong" for strength in strengths):
+        return "strong"
+    return "unknown"
+
+
+def _provider_is_strongly_protected(manifest, provider):
+    """Return whether all provider-wide and path overrides are strong."""
+    return _provider_protection_strength(manifest, provider) == "strong"
+
+
 def _parse_manifest(decompiled_dir):
     """Parse AndroidManifest.xml (apktool output) once for all manifest-based checks.
 
@@ -1015,8 +1186,11 @@ def _parse_manifest(decompiled_dir):
         root = tree.getroot()
     except (ET.ParseError, OSError, ValueError):
         return info
+    package = root.get("package", "")
+    if root.tag != "manifest" or not _is_valid_package(package):
+        return info
     info["parsed"] = True
-    info["package"] = root.get("package", "")
+    info["package"] = package
 
     ns = f"{{{_ANDROID_NS}}}"
 
@@ -1040,6 +1214,14 @@ def _parse_manifest(decompiled_dir):
         except Exception:
             pass
 
+    # Android's platform defaults are minSdkVersion=1 and
+    # targetSdkVersion=minSdkVersion.  These defaults affect exported-provider
+    # and cleartext behavior, so leaving them unknown changes security results.
+    if info["min_sdk"] is None:
+        info["min_sdk"] = "1"
+    if info["target_sdk"] is None:
+        info["target_sdk"] = info["min_sdk"]
+
     # Permissions
     for perm_tag in ("uses-permission", "uses-permission-sdk-23"):
         for perm in root.findall(perm_tag):
@@ -1059,7 +1241,10 @@ def _parse_manifest(decompiled_dir):
         info["debuggable"] = app.get(f"{ns}debuggable") == "true"
         info["allow_backup"] = app.get(f"{ns}allowBackup") != "false"
         app_enabled = app.get(f"{ns}enabled") != "false"
-        app_permission = app.get(f"{ns}permission")
+        app_permission = app.get(f"{ns}permission") or None
+        app_task_affinity = app.get(f"{ns}taskAffinity")
+        if app_task_affinity is None:
+            app_task_affinity = info["package"]
         nsc = app.get(f"{ns}networkSecurityConfig")
         if nsc is not None:
             info["has_nsc"] = True
@@ -1081,21 +1266,27 @@ def _parse_manifest(decompiled_dir):
                 bucket = "activity" if tag == "activity-alias" else tag
                 if bucket == "activity":
                     affinity = comp.get(f"{ns}taskAffinity")
+                    if affinity is None:
+                        affinity = app_task_affinity
                     if affinity and affinity != info["package"]:
                         info["task_affinity"].append((name, affinity))
 
                 intent_filters = comp.findall("intent-filter")
-
-                # Deeplinks from <data> elements in any intent-filter
+                filter_details = []
                 for filt in intent_filters:
-                    for data in filt.findall("data"):
-                        scheme = data.get(f"{ns}scheme")
-                        if (scheme and scheme not in ("http", "https")
-                                and scheme not in info["deeplinks"]["schemes"]):
-                            info["deeplinks"]["schemes"].append(scheme)
-                        host = data.get(f"{ns}host")
-                        if host and host not in info["deeplinks"]["hosts"]:
-                            info["deeplinks"]["hosts"].append(host)
+                    filter_actions = [
+                        action.get(f"{ns}name")
+                        for action in filt.findall("action")
+                        if action.get(f"{ns}name")
+                    ]
+                    filter_categories = [
+                        category.get(f"{ns}name")
+                        for category in filt.findall("category")
+                        if category.get(f"{ns}name")
+                    ]
+                    filter_details.append(
+                        (filt, filter_actions, filter_categories)
+                    )
 
                 exported_attr = comp.get(f"{ns}exported")
                 if exported_attr is not None:
@@ -1109,43 +1300,93 @@ def _parse_manifest(decompiled_dir):
                 if not is_exported:
                     continue
 
+                # A browser-style deep link must be reachable from outside and
+                # have VIEW and BROWSABLE in the same filter.  Keeping filter
+                # boundaries avoids combining unrelated actions/categories.
+                if bucket == "activity":
+                    for filt, filter_actions, filter_categories in filter_details:
+                        if ("android.intent.action.VIEW" not in filter_actions
+                                or "android.intent.category.BROWSABLE"
+                                not in filter_categories):
+                            continue
+                        for data in filt.findall("data"):
+                            scheme = data.get(f"{ns}scheme")
+                            if (scheme and scheme
+                                    not in info["deeplinks"]["schemes"]):
+                                info["deeplinks"]["schemes"].append(scheme)
+                            host = data.get(f"{ns}host")
+                            if (host and host
+                                    not in info["deeplinks"]["hosts"]):
+                                info["deeplinks"]["hosts"].append(host)
+
                 if tag == "provider":
                     authorities = comp.get(f"{ns}authorities")
-                    component_permission = comp.get(f"{ns}permission") or app_permission
+                    component_permission_attr = comp.get(f"{ns}permission")
+                    component_permission = (
+                        app_permission if component_permission_attr is None
+                        else component_permission_attr or None
+                    )
+                    read_permission_attr = comp.get(f"{ns}readPermission")
+                    write_permission_attr = comp.get(f"{ns}writePermission")
                     prov = {
                         "name": name,
                         "authorities": authorities.split(";") if authorities else [],
-                        "read_perm": comp.get(f"{ns}readPermission") or component_permission,
-                        "write_perm": comp.get(f"{ns}writePermission") or component_permission,
+                        "read_perm": (
+                            component_permission if read_permission_attr is None
+                            else read_permission_attr or None
+                        ),
+                        "write_perm": (
+                            component_permission if write_permission_attr is None
+                            else write_permission_attr or None
+                        ),
                         "grant_uri": comp.get(f"{ns}grantUriPermissions") == "true",
                         "path_permissions": [],
                     }
                     for pp in comp.findall("path-permission"):
                         path = (pp.get(f"{ns}path") or pp.get(f"{ns}pathPrefix")
-                                or pp.get(f"{ns}pathPattern"))
+                                or pp.get(f"{ns}pathPattern")
+                                or pp.get(f"{ns}pathAdvancedPattern")
+                                or pp.get(f"{ns}pathSuffix"))
+                        generic_permission = pp.get(f"{ns}permission")
+                        generic_permission = generic_permission or None
+                        path_read_attr = pp.get(f"{ns}readPermission")
+                        path_write_attr = pp.get(f"{ns}writePermission")
                         prov["path_permissions"].append({
                             "path": path,
-                            "read_perm": pp.get(f"{ns}readPermission"),
-                            "write_perm": pp.get(f"{ns}writePermission"),
+                            "permission": generic_permission,
+                            "read_perm": (
+                                generic_permission if path_read_attr is None
+                                else path_read_attr or None
+                            ),
+                            "write_perm": (
+                                generic_permission if path_write_attr is None
+                                else path_write_attr or None
+                            ),
                         })
                     info["exported"]["provider"].append(prov)
                 else:
                     actions = []
                     categories = []
-                    for filt in intent_filters:
-                        for action in filt.findall("action"):
-                            act = action.get(f"{ns}name")
+                    for _filt, filter_actions, filter_categories in filter_details:
+                        for act in filter_actions:
                             if act and act not in actions:
                                 actions.append(act)
-                        for category in filt.findall("category"):
-                            cat = category.get(f"{ns}name")
+                        for cat in filter_categories:
                             if cat and cat not in categories:
                                 categories.append(cat)
+                    permission_attr = comp.get(f"{ns}permission")
+                    if tag == "activity-alias":
+                        component_permission = permission_attr or None
+                    else:
+                        component_permission = (
+                            app_permission if permission_attr is None
+                            else permission_attr or None
+                        )
                     entry = {
                         "name": name,
                         "actions": actions,
                         "categories": categories,
-                        "permission": comp.get(f"{ns}permission") or app_permission,
+                        "permission": component_permission,
                         "component_type": tag,
                     }
                     if tag == "activity-alias":
@@ -1181,9 +1422,10 @@ def _resolve_resource_path(decompiled_dir, resource_ref):
 
 # ─── Network Security Config ─────────────────────────────────────────────────────
 
-def _analyze_nsc(decompiled_dir, nsc_path=None):
+def _analyze_nsc(decompiled_dir, nsc_path=None, target_sdk=None):
     """Parse network_security_config.xml for pinning and cleartext policy."""
     info = {"parsed": False, "pins": [], "cleartext_allowed": False,
+            "cleartext_known": False,
             "trusts_user_certs": False, "trusts_debug_user_certs": False,
             "trust_anchors": [], "path": None}
 
@@ -1201,17 +1443,45 @@ def _analyze_nsc(decompiled_dir, nsc_path=None):
     try:
         tree = _safe_parse_xml(nsc_path, max_bytes=2 * 1024 * 1024)
         root = tree.getroot()
-        info["parsed"] = True
+        if root.tag != "network-security-config":
+            raise ValueError("invalid network security config root")
 
-        # Check base-config cleartext
-        for base in root.findall(".//base-config"):
-            if base.get("cleartextTrafficPermitted") == "true":
-                info["cleartext_allowed"] = True
+        def cleartext_value(node, inherited):
+            raw = node.get("cleartextTrafficPermitted")
+            if raw is None:
+                return inherited
+            if raw not in ("true", "false"):
+                raise ValueError("invalid cleartextTrafficPermitted value")
+            return raw == "true"
 
-        # Check domain-config cleartext
-        for dc in root.findall(".//domain-config"):
-            if dc.get("cleartextTrafficPermitted") == "true":
-                info["cleartext_allowed"] = True
+        platform_default = None
+        if target_sdk is not None and str(target_sdk).isdigit():
+            platform_default = int(target_sdk) <= 27
+
+        base_configs = root.findall("./base-config")
+        if len(base_configs) > 1:
+            raise ValueError("multiple base-config elements")
+        base_cleartext = (
+            cleartext_value(base_configs[0], platform_default)
+            if base_configs else platform_default
+        )
+        any_cleartext = base_cleartext is True
+
+        def visit_domain_config(node, inherited):
+            nonlocal any_cleartext
+            effective = cleartext_value(node, inherited)
+            if effective is True:
+                any_cleartext = True
+            for child in node.findall("./domain-config"):
+                visit_domain_config(child, effective)
+
+        for domain_config in root.findall("./domain-config"):
+            visit_domain_config(domain_config, base_cleartext)
+
+        info["cleartext_allowed"] = any_cleartext
+        # If any scope explicitly/effectively permits cleartext, the risk is
+        # known. Otherwise all scopes are known only when the base/default is.
+        info["cleartext_known"] = any_cleartext or base_cleartext is not None
 
         # Pin-set entries
         for ps in root.findall(".//pin-set"):
@@ -1247,6 +1517,8 @@ def _analyze_nsc(decompiled_dir, nsc_path=None):
                 if src == "user":
                     info["trusts_debug_user_certs"] = True
 
+        info["parsed"] = True
+
     except (ET.ParseError, OSError, ValueError):
         pass
     return info
@@ -1269,8 +1541,10 @@ def _print_nsc_analysis(info):
 
     if info["cleartext_allowed"]:
         print(f"    {C.RED}[FAIL]{C.RST} Cleartext (HTTP) traffic allowed")
+    elif info.get("cleartext_known"):
+        print(f"    {C.GREEN}[PASS]{C.RST} Effective cleartext policy is disabled")
     else:
-        print(f"    {C.GREEN}[PASS]{C.RST} Cleartext traffic not explicitly allowed")
+        print(f"    {C.YELLOW}[WARN]{C.RST} Effective cleartext policy could not be determined")
 
     if info["trusts_user_certs"]:
         print(f"    {C.YELLOW}[WARN]{C.RST} Trusts user-installed certificates")
@@ -1509,69 +1783,191 @@ def app_analysis(pkg):
 
 # ─── 2. Storage Audit ───────────────────────────────────────────────────────────
 
+STATIC_SECRET_MAX_FILE_BYTES = 500_000
+STATIC_SECRET_EXTENSIONS = (
+    '.xml', '.json', '.properties', '.yml', '.yaml', '.env', '.ini', '.cfg',
+    '.conf', '.config', '.txt', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
+    '.java', '.kt', '.kts', '.smali', '.gradle', '.toml', '.dart', '.html',
+    '.htm', '.pem', '.key',
+)
+
+
+def _should_scan_static_secrets(path):
+    """Return whether a likely-text source file is within the scanner cap."""
+    if not os.path.basename(path).lower().endswith(STATIC_SECRET_EXTENSIONS):
+        return False
+    try:
+        return os.path.getsize(path) <= STATIC_SECRET_MAX_FILE_BYTES
+    except OSError:
+        return False
+
+
+_SECRET_KEY_PATTERN = (
+    r'(?:password|passwd|pwd|api[_-]?key|apikey|secret[_-]?key|'
+    r'client[_-]?secret|app[_-]?secret|access[_-]?key|access[_-]?token|'
+    r'private[_-]?key|signing[_-]?key|auth[_-]?token|session[_-]?token|'
+    r'refresh[_-]?token|encryption[_-]?key|master[_-]?key|db[_-]?password|'
+    r'aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|'
+    r'firebase[_-]?(?:api[_-]?key|token|secret)|'
+    r'google[_-]?(?:api[_-]?key|cloud[_-]?key|maps[_-]?key)|'
+    r'(?:azure|az)[_-]?(?:storage[_-]?key|connection[_-]?string|client[_-]?secret)|'
+    r'twilio[_-]?(?:auth[_-]?token|api[_-]?key|account[_-]?sid)|'
+    r'merchant[_-]?key|payment[_-]?secret|'
+    r'(?:paypal|braintree|razorpay)[_-]?(?:secret|key|token)|'
+    r'(?:fcm|push|gcm|apns)[_-]?key|oauth[_-]?token|'
+    r'database[_-]?url|db[_-]?connection)'
+)
+
+# Capture only the value so redaction can retain JSON/XML/property syntax.  A
+# bare assignment remains whitespace-delimited; quoted JSON/XML values have
+# dedicated patterns below and may safely contain spaces.
+_SECRET_ASSIGNMENT_VALUE = (
+    r'(?:"(?P<secret_double>(?:\\.|[^"\\])*)"'
+    r"|'(?P<secret_single>(?:\\.|[^'\\])*)'"
+    r"|(?P<secret_bare>[^\s,;<>'\"]+))"
+)
+
 SECRET_PATTERNS = [
-    # ── Generic secrets ──
-    r'(?i)(password|passwd|pwd)\s*[=:]\s*\S+',
-    r'(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+',
-    r'(?i)(secret[_-]?key|client[_-]?secret|app[_-]?secret)\s*[=:]\s*\S+',
-    r'(?i)(access[_-]?key|access[_-]?token)\s*[=:]\s*\S+',
-    r'(?i)(private[_-]?key|signing[_-]?key)\s*[=:]\s*\S+',
-    r'(?i)(auth[_-]?token|session[_-]?token|refresh[_-]?token)\s*[=:]\s*\S+',
-    r'(?i)(encryption[_-]?key|master[_-]?key|db[_-]?password)\s*[=:]\s*\S+',
-    r'eyJ[A-Za-z0-9_-]{10,}',  # JWT
-    r'(?i)bearer\s+[A-Za-z0-9_.-]+',
-    # ── AWS ──
-    r'AKIA[0-9A-Z]{16}',  # AWS Access Key ID
-    r'(?i)aws[_-]?secret[_-]?access[_-]?key\s*[=:]\s*\S+',
-    r'(?i)aws[_-]?session[_-]?token\s*[=:]\s*\S+',
-    # ── Google / Firebase ──
-    r'AIza[0-9A-Za-z_-]{35}',  # Google API key
-    r'(?i)firebase[_-]?(api[_-]?key|token|secret)\s*[=:]\s*\S+',
-    r'(?i)google[_-]?(api[_-]?key|cloud[_-]?key|maps[_-]?key)\s*[=:]\s*\S+',
-    # ── Azure ──
-    r'(?i)(azure|az)[_-]?(storage[_-]?key|connection[_-]?string|client[_-]?secret)\s*[=:]\s*\S+',
-    r'DefaultEndpointsProtocol=https;AccountName=\S+',  # Azure connection string
-    # ── Stripe ──
-    r'sk_live_[0-9a-zA-Z]{24,}',  # Stripe secret key
-    r'rk_live_[0-9a-zA-Z]{24,}',  # Stripe restricted key
-    # ── Twilio ──
-    r'SK[0-9a-fA-F]{32}',  # Twilio API key
-    r'(?i)twilio[_-]?(auth[_-]?token|api[_-]?key|account[_-]?sid)\s*[=:]\s*\S+',
-    # ── SendGrid ──
-    r'SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}',  # SendGrid API key
-    # ── Slack ──
-    r'xox[bprs]-[0-9a-zA-Z-]+',  # Slack token
-    r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+',  # Slack webhook
-    # ── GitHub ──
-    r'gh[ps]_[A-Za-z0-9_]{36,}',  # GitHub PAT
-    r'github_pat_[A-Za-z0-9_]{22,}',  # GitHub fine-grained PAT
-    # ── Payment / Merchant ──
-    r'(?i)(merchant[_-]?key|payment[_-]?secret)\s*[=:]\s*\S+',
-    r'(?i)(paypal|braintree|razorpay)[_-]?(secret|key|token)\s*[=:]\s*\S+',
-    # ── Push / Messaging ──
-    r'(?i)(fcm[_-]?key|push[_-]?key|gcm[_-]?key|apns[_-]?key)\s*[=:]\s*\S+',
-    r'key=[A-Za-z0-9_-]{39}',  # FCM server key format
-    # ── OAuth / SSO ──
-    r'(?i)(client[_-]?secret|oauth[_-]?token)\s*[=:]\s*\S+',
-    # ── Database ──
-    r'(?i)(mongodb|postgres|mysql|redis)://\S+:\S+@\S+',  # DB connection string with creds
-    r'(?i)(database[_-]?url|db[_-]?connection)\s*[=:]\s*\S+',
-    # ── Private keys / certs ──
-    r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
+    # Normal JSON and Android SharedPreferences XML representations.
+    re.compile(
+        rf'"{_SECRET_KEY_PATTERN}"\s*:\s*'
+        r'"(?P<secret_json>(?:\\.|[^"\\])*)"',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf'<string\b(?=[^>]*\bname\s*=\s*["\']{_SECRET_KEY_PATTERN}["\'])'
+        r'[^>]*>(?P<secret_xml>[^<]*)</string\s*>',
+        re.IGNORECASE,
+    ),
+    # apktool/smali static String fields keep a JVM type descriptor between
+    # the key-like field name and its quoted initializer.
+    re.compile(
+        rf'(?m)^\s*\.field\b[^\r\n]*\b{_SECRET_KEY_PATTERN}'
+        r':Ljava/lang/String;\s*=\s*"(?P<secret_smali>(?:\\.|[^"\\])*)"',
+        re.IGNORECASE,
+    ),
+    # Generic quoted or whitespace-delimited key/value assignments.
+    re.compile(
+        rf'(?<![\w-]){_SECRET_KEY_PATTERN}\s*[=:]\s*'
+        rf'(?!\[*(?:[ZBSCIJFDV]|L[A-Za-z0-9_/$]+;)(?=\s*(?:=|$)))'
+        rf'{_SECRET_ASSIGNMENT_VALUE}',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}'
+        r'\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+        r'(?![A-Za-z0-9_-])'
+    ),  # compact JWT/JWS
+    re.compile(r'bearer\s+[A-Za-z0-9_.-]+', re.IGNORECASE),
+    # Azure connection string (legacy rule retained).
+    re.compile(r'DefaultEndpointsProtocol=https;AccountName=\S+'),
+    # Stripe.
+    re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
+    re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
+    # SendGrid.
+    re.compile(r'SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}'),
+    # Slack.
+    re.compile(r'xox[bprs]-[0-9a-zA-Z-]+'),
+    re.compile(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+'),
+    # GitHub.
+    re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'),
+    re.compile(r'github_pat_[A-Za-z0-9_]{22,}'),
+    # Legacy FCM server-key syntax.  Boundaries prevent matching the suffix of
+    # names such as firebase_api_key.
+    re.compile(
+        r'(?<![\w-])key=(?P<secret_fcm>[A-Za-z0-9_-]{39})(?![A-Za-z0-9_-])',
+        re.IGNORECASE,
+    ),
+    # Database connection string with a fixed first ':' and '@' delimiter.
+    # The disjoint character classes avoid the quadratic backtracking caused
+    # by the former ``\S+:\S+@\S+`` expression on colon-heavy malformed input.
+    re.compile(
+        r'\b(?P<secret_db>(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis)://'
+        r'[^\s/:@]+:[^\s/@]+@[^\s/?#]+(?:[/?#][^\s]*)?)',
+        re.IGNORECASE,
+    ),
+    # Private keys.  Redact the complete block rather than only its BEGIN
+    # marker; a truncated block is treated conservatively through EOF.
+    re.compile(
+        r'(?P<secret_pem>-----BEGIN '
+        r'(?P<secret_pem_label>(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY)-----'
+        r'[\s\S]{0,500000}?(?:-----END (?P=secret_pem_label)-----|\Z))'
+    ),
 ]
 
+_SECRET_VALUE_GROUPS = (
+    "secret_double", "secret_single", "secret_bare", "secret_json",
+    "secret_xml", "secret_smali", "secret_fcm", "secret_db", "secret_pem",
+)
+_PUBLIC_IDENTIFIER_PATTERNS = (
+    # Firebase/Google Android API keys are public identifiers whose security
+    # comes from API/application restrictions, not from keeping the value secret.
+    re.compile(r'AIza[0-9A-Za-z_-]{35}'),
+    # Twilio SK values are API-key SIDs; the separately returned Secret is the
+    # credential and does not use this format.
+    re.compile(r'SK[0-9a-fA-F]{32}'),
+    re.compile(r'AC[0-9a-fA-F]{32}'),  # Twilio Account SID
+    re.compile(r'AKIA[0-9A-Z]{16}'),  # AWS access-key ID, not the secret key
+)
 
-def _find_secret_matches(content, per_pattern_limit=None):
-    """Return full regex matches (not only capturing groups) for secrets."""
-    matches = []
+
+def _secret_value_and_span(match):
+    """Return the credential portion of a secret match and its source span."""
+    groups = match.groupdict()
+    for name in _SECRET_VALUE_GROUPS:
+        value = groups.get(name)
+        if value is not None:
+            return value, match.span(name)
+    return match.group(0), match.span(0)
+
+
+def _is_public_secret_identifier(value):
+    candidate = value.strip()
+    return any(pattern.fullmatch(candidate)
+               for pattern in _PUBLIC_IDENTIFIER_PATTERNS)
+
+
+def _iter_secret_matches(content, per_pattern_limit=None):
+    """Yield non-empty, non-public secret matches with bounded per-rule output."""
     for pattern in SECRET_PATTERNS:
         count = 0
-        for match in re.finditer(pattern, content):
-            matches.append(match.group(0))
+        for match in pattern.finditer(content):
+            value, _span = _secret_value_and_span(match)
+            if not value.strip() or _is_public_secret_identifier(value):
+                continue
+            yield match
             count += 1
             if per_pattern_limit is not None and count >= per_pattern_limit:
                 break
-    return matches
+
+
+def _find_secret_matches(content, per_pattern_limit=None):
+    """Return full regex matches, excluding known public identifiers."""
+    return [match.group(0) for match in
+            _iter_secret_matches(content, per_pattern_limit)]
+
+
+def _redact_secret_text(content):
+    """Redact complete credential spans while retaining surrounding syntax."""
+    spans = []
+    for match in _iter_secret_matches(content):
+        _value, span = _secret_value_and_span(match)
+        if span[0] != span[1]:
+            spans.append(span)
+    if not spans:
+        return content
+
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+
+    redacted = content
+    for start, end in reversed(merged):
+        redacted = redacted[:start] + "[REDACTED]" + redacted[end:]
+    return redacted
 
 
 def _sqlite_identifier(name):
@@ -1634,9 +2030,7 @@ def _scan_pii(content):
 
 def _redact_sensitive_text(content):
     """Redact detected secrets and PII before showing raw storage previews."""
-    redacted = content
-    for pattern in SECRET_PATTERNS:
-        redacted = re.sub(pattern, lambda match: _redact(match.group(0)), redacted)
+    redacted = _redact_secret_text(content)
     for pattern, _label in PII_PATTERNS:
         redacted = pattern.sub(lambda match: _redact(match.group(0)), redacted)
     return redacted
@@ -2313,6 +2707,24 @@ def _finding_line(check_key, label, detail=""):
     extra = f" {C.DIM}-- {detail}{C.RST}" if detail else ""
     print(f"  {sev_tag} {label}  {ref_tag}{extra}")
 
+
+def _find_static_secret_files(decompiled_dir):
+    """Find bounded text files containing secret patterns without a manifest."""
+    matches = []
+    for root, _dirs, files in os.walk(decompiled_dir):
+        for fname in files:
+            path = os.path.join(root, fname)
+            if not _should_scan_static_secrets(path):
+                continue
+            try:
+                with open(path, "r", errors="ignore") as source:
+                    content = source.read(STATIC_SECRET_MAX_FILE_BYTES + 1)
+            except OSError:
+                continue
+            if _find_secret_matches(content, per_pattern_limit=1):
+                matches.append(os.path.relpath(path, decompiled_dir))
+    return matches
+
 def security_scan(pkg):
     section("SECURITY SCAN")
 
@@ -2355,6 +2767,37 @@ def security_scan(pkg):
     manifest = _parse_manifest(decompiled_dir)
     if not manifest["parsed"]:
         print(f"  {C.RED}[!] Could not read AndroidManifest.xml{C.RST}")
+        print(f"  {C.YELLOW}[INCONCLUSIVE]{C.RST} Manifest-dependent checks were skipped; bounded code/resource checks will continue.")
+
+        fw_info = detect_framework(decompiled_dir)
+        _print_framework_info(fw_info)
+        independent_secret_files = _find_static_secret_files(decompiled_dir)
+        print(f"\n  {C.YELLOW}{C.BOLD}── Data Leakage Check ──{C.RST}")
+        if independent_secret_files:
+            _finding_line(
+                "hardcoded_secrets", "Hardcoded secrets",
+                f"Potential secrets found in {len(independent_secret_files)} file(s)",
+            )
+            info = SECURITY_CHECKS["hardcoded_secrets"]
+            report.add_finding(
+                category=info["masvs"], title=info["title"],
+                severity=info["severity"], confidence="HIGH",
+                description=(
+                    "Potential secrets/keys found despite an unreadable manifest: "
+                    + ", ".join(independent_secret_files[:5])
+                ),
+                remediation=info["remediation"], masvs=info["masvs"],
+                cwe=info["cwe"],
+            )
+            for rel_path in independent_secret_files[:5]:
+                print(f"    {C.DIM}{rel_path}{C.RST}")
+        else:
+            info_line(
+                "Manifest-independent secret scan",
+                "No matches in bounded supported text files",
+            )
+        pause()
+        return
 
     # ── Framework & Native SDK Detection ─────────────────────────────────────
     fw_info = detect_framework(decompiled_dir)
@@ -2387,19 +2830,16 @@ def security_scan(pkg):
 
     for root, dirs, files in os.walk(decompiled_dir):
         for fname in files:
-            is_smali = fname.endswith('.smali')
-            is_xml = fname.endswith('.xml')
-            is_secret_ext = fname.endswith(('.xml', '.json', '.properties', '.yml', '.yaml'))
+            lower_fname = fname.lower()
+            is_smali = lower_fname.endswith('.smali')
+            is_xml = lower_fname.endswith('.xml')
+            is_secret_ext = lower_fname.endswith(STATIC_SECRET_EXTENSIONS)
             if not (is_smali or is_xml or is_secret_ext):
                 continue
             fpath = os.path.join(root, fname)
-            # Secrets scan: skip large files and the manifest (already parsed)
-            do_secrets = False
-            if is_secret_ext and fname != "AndroidManifest.xml":
-                try:
-                    do_secrets = os.path.getsize(fpath) <= 500000
-                except Exception:
-                    do_secrets = False
+            # Secret scanning includes the manifest and smali but remains
+            # bounded per file.  Other checks retain their existing inputs.
+            do_secrets = _should_scan_static_secrets(fpath) if is_secret_ext else False
             if not (is_smali or is_xml or do_secrets):
                 continue
             try:
@@ -2500,17 +2940,15 @@ def security_scan(pkg):
 
     exposed_components = []
     gated_components = []
+    unknown_gated_components = []
 
-    def permission_is_strong(permission):
-        if not permission:
-            return False
-        level = manifest["declared_permissions"].get(permission)
-        if level is None:
-            # Platform or dependency permissions cannot be resolved from this
-            # manifest, but are still meaningful access controls.
-            return True
-        base_levels = {part.strip() for part in level.split("|")}
-        return bool(base_levels & {"signature", "signatureOrSystem", "knownSigner"})
+    def classify_component(kind, component, strength):
+        target = {
+            "strong": gated_components,
+            "weak": exposed_components,
+            "unknown": unknown_gated_components,
+        }[strength]
+        target.append((kind, component["name"], component.get("permission")))
 
     for comp in manifest["exported"]["activity"]:
         is_launcher = (
@@ -2519,38 +2957,50 @@ def security_scan(pkg):
         )
         if is_launcher:
             continue
-        target = (gated_components if permission_is_strong(comp.get("permission"))
-                  else exposed_components)
-        target.append(("Activity", comp["name"]))
+        classify_component(
+            "Activity", comp,
+            _permission_strength(manifest, comp.get("permission")),
+        )
     for bucket, label in (("service", "Service"), ("receiver", "Receiver")):
         for comp in manifest["exported"][bucket]:
-            target = (gated_components if permission_is_strong(comp.get("permission"))
-                      else exposed_components)
-            target.append((label, comp["name"]))
+            classify_component(
+                label, comp,
+                _permission_strength(manifest, comp.get("permission")),
+            )
     for comp in manifest["exported"]["provider"]:
-        # Both read and write access need a permission to call the provider
-        # protected. Path permissions alone do not cover the provider root.
-        protected = (permission_is_strong(comp.get("read_perm"))
-                     and permission_is_strong(comp.get("write_perm")))
-        target = gated_components if protected else exposed_components
-        target.append(("Provider", comp["name"]))
+        strength = _provider_protection_strength(manifest, comp)
+        target = {
+            "strong": gated_components,
+            "weak": exposed_components,
+            "unknown": unknown_gated_components,
+        }[strength]
+        target.append(("Provider", comp["name"], None))
 
     if exposed_components:
         total_exported = len(exposed_components)
         _finding_line("exported_components", f"Unprotected exported components: {total_exported}")
         fails += 1
-        comp_list = [f"{kind}: {name}" for kind, name in exposed_components]
+        comp_list = [f"{kind}: {name}" for kind, name, _permission in exposed_components]
         _record_finding("exported_components",
                          f"{total_exported} exported component(s) lack manifest permission protection: "
                          f"{'; '.join(comp_list[:10])}")
-        for kind, name in exposed_components[:20]:
+        for kind, name, _permission in exposed_components[:20]:
             print(f"    {C.DIM}{kind}: {name}{C.RST}")
-    else:
+    elif not unknown_gated_components:
         pass_fail("Exported components", True,
                   "Only launcher or permission-gated components are exported")
         passes += 1
     if gated_components:
         info_line("Permission-gated exports", f"{len(gated_components)} component(s)")
+    if unknown_gated_components:
+        warns += 1
+        warn_line(
+            "Unresolved exported-component permissions",
+            f"{len(unknown_gated_components)} component(s); protection level could not be verified",
+        )
+        for kind, name, permission in unknown_gated_components[:10]:
+            suffix = f" ({permission})" if permission else ""
+            print(f"    {C.DIM}{kind}: {name}{suffix}{C.RST}")
 
     # ── 4. Permissions ───────────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}── Dangerous Permissions ──{C.RST}")
@@ -2569,7 +3019,9 @@ def security_scan(pkg):
             remediation=info["remediation"], masvs=info["masvs"], cwe=info["cwe"],
         )
         for dp in sorted(dangerous_requested):
-            short = dp.removeprefix("android.permission.")
+            permission_prefix = "android.permission."
+            short = (dp[len(permission_prefix):]
+                     if dp.startswith(permission_prefix) else dp)
             print(f"    {C.DIM}\u2022 {short}{C.RST}")
     else:
         pass_fail("Dangerous permissions", True, "No dangerous permissions requested")
@@ -2620,25 +3072,50 @@ def security_scan(pkg):
     total_checks_run += 1
     nsc_path = _resolve_resource_path(decompiled_dir, manifest["nsc_ref"])
     if manifest["has_nsc"]:
-        nsc_info = _analyze_nsc(decompiled_dir, nsc_path=nsc_path)
+        nsc_info = _analyze_nsc(
+            decompiled_dir, nsc_path=nsc_path, target_sdk=target_sdk
+        )
     else:
         nsc_info = {"parsed": False, "pins": [], "cleartext_allowed": False,
+                    "cleartext_known": False,
                     "trusts_user_certs": False, "trusts_debug_user_certs": False,
                     "trust_anchors": [], "path": None}
-    cleartext = manifest["cleartext"]
-    if nsc_info["cleartext_allowed"]:
-        cleartext = True
+    cleartext_source = None
+    if manifest["has_nsc"]:
+        # Android 7.0+ ignores usesCleartextTraffic when an NSC is present.
+        # Do not OR the manifest value into the parsed NSC policy.
+        if nsc_info["parsed"] and nsc_info["cleartext_known"]:
+            cleartext = nsc_info["cleartext_allowed"]
+            cleartext_source = "network security config"
+            if min_sdk != "N/A" and int(min_sdk) <= 22:
+                cleartext = True
+                cleartext_source = "pre-Android 6 platform behavior"
+            elif (min_sdk == "23" and (
+                    manifest["cleartext"] is True
+                    or not manifest["cleartext_explicit"])):
+                cleartext = True
+                cleartext_source = (
+                    "manifest on Android 6"
+                    if manifest["cleartext_explicit"]
+                    else "Android 6 platform default"
+                )
+        else:
+            cleartext = None
+    else:
+        cleartext = manifest["cleartext"]
+        if manifest["cleartext_explicit"]:
+            cleartext_source = "manifest"
+        else:
+            cleartext_source = f"target SDK {target_sdk} platform default"
     if cleartext is not None:
         if cleartext:
-            source = ("network security config" if nsc_info["cleartext_allowed"]
-                      else ("manifest" if manifest["cleartext_explicit"]
-                            else f"target SDK {target_sdk} platform default"))
+            source = cleartext_source or "effective platform policy"
             _finding_line("cleartext_traffic", "Cleartext traffic", f"HTTP allowed by {source}")
             fails += 1
             _record_finding("cleartext_traffic",
                              f"Cleartext HTTP communication is allowed by {source}.")
         else:
-            source = "manifest" if manifest["cleartext_explicit"] else "platform default"
+            source = cleartext_source or "effective platform policy"
             pass_fail("Cleartext traffic", True, f"Disabled by {source}")
             passes += 1
     else:
@@ -2683,15 +3160,15 @@ def security_scan(pkg):
     deeplinks = manifest["deeplinks"]["schemes"] + manifest["deeplinks"]["hosts"]
     if deeplinks:
         unique_links = list(set(deeplinks))
-        _finding_line("deeplinks", f"Found {len(unique_links)} custom deeplink scheme(s)/host(s)")
+        _finding_line("deeplinks", f"Found {len(unique_links)} deeplink scheme(s)/host(s)")
         fails += 1
         _record_finding("deeplinks",
-                         f"{len(unique_links)} custom deeplink scheme(s)/host(s): {', '.join(unique_links[:5])}")
+                         f"{len(unique_links)} deeplink scheme(s)/host(s): {', '.join(unique_links[:5])}")
         for dl in unique_links[:5]:
             print(f"    {C.DIM}\u2022 {dl}{C.RST}")
         print(f"    {C.DIM}Risk: Deeplink hijacking if not validated properly{C.RST}")
     else:
-        pass_fail("Deeplinks", True, "No custom deeplink schemes found")
+        pass_fail("Deeplinks", True, "No externally reachable deeplink filters found")
         passes += 1
 
     # ── 10. WebView JavaScript Interface ─────────────────────────────────────
@@ -3807,6 +4284,41 @@ def anti_tamper_check(pkg):
 
 # ─── ADB Backup Extraction (allowBackup=true vector) ─────────────────────────────
 
+def _find_symlinked_path_component(path):
+    """Return a symlink at or above *path*, including broken symlinks."""
+    cursor = os.path.abspath(os.fspath(path))
+    while True:
+        if os.path.lexists(cursor) and os.path.islink(cursor):
+            return cursor
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            return None
+        cursor = parent
+
+
+def _filesystem_is_case_sensitive(directory):
+    """Probe the destination filesystem instead of guessing from the host OS."""
+    probe_path = None
+    try:
+        fd, probe_path = tempfile.mkstemp(
+            prefix=".ApkAnalyzerCaseProbe", dir=directory
+        )
+        os.close(fd)
+        alternate = os.path.join(
+            directory, os.path.basename(probe_path).swapcase()
+        )
+        return not os.path.exists(alternate)
+    except OSError:
+        # Conservative fallback for the two commonly case-insensitive hosts.
+        return os.name != "nt" and sys.platform != "darwin"
+    finally:
+        if probe_path and os.path.exists(probe_path):
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
+
+
 def _unpack_ab(ab_path, out_dir):
     """Parse an Android .ab backup and extract its tar payload into out_dir.
 
@@ -3877,11 +4389,22 @@ def _unpack_ab(ab_path, out_dir):
                 return 0, "backup contains no data (app disallows backup or returned an empty set)"
 
             payload_file.seek(0)
-            os.makedirs(out_dir, exist_ok=True)
             output_root = os.path.abspath(out_dir)
+            # A symlink used as (or above) the logical extraction root defeats
+            # descendant-only checks: an otherwise safe member would be written
+            # outside the directory named by the caller.
+            symlink_component = _find_symlinked_path_component(output_root)
+            if symlink_component:
+                return 0, (
+                    "refusing symlinked backup output path component: "
+                    f"{symlink_component}"
+                )
+            os.makedirs(output_root, exist_ok=True)
+            case_sensitive_output = _filesystem_is_case_sensitive(output_root)
 
             with tarfile.open(fileobj=payload_file, mode="r:*") as tar:
                 members = []
+                destination_trie = {}
                 total_size = 0
                 for member in tar:
                     if not member.isfile():
@@ -3904,10 +4427,30 @@ def _unpack_ab(ab_path, out_dir):
                     destination = os.path.abspath(os.path.join(output_root, *parts))
                     if os.path.commonpath((output_root, destination)) != output_root:
                         return 0, f"unsafe backup member path: {name!r}"
+                    # Reject duplicate paths and file/directory prefix conflicts
+                    # before writing anything (for example, both ``a`` and
+                    # ``a/b``). Case-folding also avoids partial extraction on
+                    # Windows-style case-insensitive destinations.
+                    trie_node = destination_trie
+                    normalized_parts = (
+                        parts if case_sensitive_output
+                        else [item.casefold() for item in parts]
+                    )
+                    for part in normalized_parts:
+                        if None in trie_node:
+                            return 0, f"conflicting backup member path: {name!r}"
+                        trie_node = trie_node.setdefault(part, {})
+                    if None in trie_node:
+                        return 0, f"duplicate backup member path: {name!r}"
+                    if trie_node:
+                        return 0, f"conflicting backup member path: {name!r}"
+                    trie_node[None] = True
                     members.append((member, destination))
 
-                count = 0
-                for member, destination in members:
+                # Check every existing path and parent symlink before the first
+                # output file is opened, so a late conflict cannot leave a
+                # misleading partial extraction behind.
+                for _member, destination in members:
                     parent = os.path.dirname(destination)
                     relative_parent = os.path.relpath(parent, output_root)
                     cursor = output_root
@@ -3915,10 +4458,17 @@ def _unpack_ab(ab_path, out_dir):
                         for part in relative_parent.split(os.sep):
                             cursor = os.path.join(cursor, part)
                             if os.path.lexists(cursor) and os.path.islink(cursor):
-                                return count, f"refusing to extract through symlink: {cursor}"
-                    os.makedirs(parent, exist_ok=True)
+                                return 0, f"refusing to extract through symlink: {cursor}"
+                            if (os.path.lexists(cursor)
+                                    and not os.path.isdir(cursor)):
+                                return 0, f"backup parent path is not a directory: {cursor}"
                     if os.path.lexists(destination):
-                        return count, f"refusing to overwrite existing path: {destination}"
+                        return 0, f"refusing to overwrite existing path: {destination}"
+
+                count = 0
+                for member, destination in members:
+                    parent = os.path.dirname(destination)
+                    os.makedirs(parent, exist_ok=True)
                     extracted = tar.extractfile(member)
                     if extracted is None:
                         continue
@@ -4900,12 +5450,23 @@ def _patch_manifest_for_gadget(manifest_path):
         return False
 
 def _inject_gadget_loader(smali_path):
-    """Inject System.loadLibrary('frida-gadget') into smali class."""
+    """Inject System.loadLibrary('frida-gadget') into a static initializer."""
     try:
         with open(smali_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        if 'const-string v0, "frida-gadget"' in content:
+        existing_loader = re.search(
+            r"(?ms)^\s*\.method\b[^\r\n]*<clinit>\(\)V\s*$"
+            r"(?P<body>.*?)^\s*\.end\s+method\s*$",
+            content,
+        )
+        if (existing_loader
+                and re.search(
+                    r'(?m)^[ \t]*const-string v0, "frida-gadget"[ \t]*\r?$'
+                    r'(?:\n[ \t]*\r?)*\n[ \t]*invoke-static \{v0\},[ \t]*'
+                    r'Ljava/lang/System;->loadLibrary\(Ljava/lang/String;\)V[ \t]*\r?$',
+                    existing_loader.group("body"),
+                )):
             return True
 
         load_lines = [
@@ -4914,7 +5475,10 @@ def _inject_gadget_loader(smali_path):
             '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V',
         ]
 
-        if ".method static constructor <clinit>()V" in content:
+        clinit_match = re.search(
+            r"(?m)^\s*\.method\b[^\r\n]*<clinit>\(\)V\s*$", content
+        )
+        if clinit_match:
             # Inject into existing <clinit>
             lines = content.split('\n')
             new_lines = []
@@ -4922,57 +5486,34 @@ def _inject_gadget_loader(smali_path):
             injected = False
             for line in lines:
                 new_lines.append(line)
-                if ".method static constructor <clinit>()V" in line:
+                if re.match(r"^\s*\.method\b[^\r\n]*<clinit>\(\)V\s*$", line):
                     in_clinit = True
                 if in_clinit and not injected:
-                    stripped = line.strip()
-                    if stripped.startswith(".locals") or stripped.startswith(".registers"):
+                    frame = re.match(
+                        r"^(\s*)\.(locals|registers)\s+(\d+)(.*)$", line
+                    )
+                    if frame:
                         # Ensure at least 1 register
-                        parts = stripped.split()
-                        if len(parts) == 2 and int(parts[1]) < 1:
-                            new_lines[-1] = line.replace(f"{parts[0]} 0", f"{parts[0]} 1")
+                        indent, directive, count, suffix = frame.groups()
+                        if int(count) < 1:
+                            new_lines[-1] = (
+                                f"{indent}.{directive} 1{suffix}"
+                            )
                         new_lines.extend(load_lines)
                         injected = True
-            if injected:
-                content = '\n'.join(new_lines)
-            else:
-                return False
-
-        elif "onCreate(Landroid/os/Bundle;)V" in content:
-            # Inject into onCreate
-            lines = content.split('\n')
-            new_lines = []
-            in_oncreate = False
-            injected = False
-            for line in lines:
-                new_lines.append(line)
-                if "onCreate(Landroid/os/Bundle;)V" in line and ".method" in line:
-                    in_oncreate = True
-                if in_oncreate and not injected:
-                    stripped = line.strip()
-                    if stripped.startswith(".locals") or stripped.startswith(".registers"):
-                        parts = stripped.split()
-                        if len(parts) == 2:
-                            n = int(parts[1])
-                            if stripped.startswith(".locals") and n < 1:
-                                new_lines[-1] = line.replace(".locals 0", ".locals 1")
-                            elif stripped.startswith(".registers") and n < 3:
-                                # onCreate is an instance method with p0 (this)
-                                # and p1 (Bundle). It needs a third register so
-                                # v0 is a real local instead of aliasing p0.
-                                indent = line[:len(line) - len(line.lstrip())]
-                                new_lines[-1] = f"{indent}.registers 3"
-                        new_lines.extend(load_lines)
-                        injected = True
+                if in_clinit and line.strip() == ".end method":
+                    in_clinit = False
             if injected:
                 content = '\n'.join(new_lines)
             else:
                 return False
         else:
-            # No <clinit> or onCreate — add a new <clinit>
+            # Never grow an instance method's frame: doing so shifts absolute
+            # v-register aliases for its parameters. A new static initializer
+            # has no parameter registers and is safe for this loader.
             clinit_block = (
                 '\n.method static constructor <clinit>()V\n'
-                '    .registers 1\n'
+                '    .registers 3\n'
                 '\n'
                 '    const-string v0, "frida-gadget"\n'
                 '\n'
@@ -5477,21 +6018,34 @@ def _runtime_data_check(pkg, launch=True):
 
     if launch:
         print(f"  {C.DIM}Launching {pkg}...{C.RST}")
-        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null", timeout=10)
+        launch_out = adb_shell(
+            f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null",
+            timeout=10,
+        )
+        _require_app_launch(launch_out)
         print(f"  {C.DIM}Waiting 5 seconds for app to initialize...{C.RST}")
         time.sleep(5)
 
     # Scan SharedPrefs
     prefs_dir = f"/data/data/{pkg}/shared_prefs"
-    files_out = adb_su(f"ls {shlex.quote(prefs_dir)} 2>/dev/null", timeout=10)
-    if not _is_err(files_out) and "No such file" not in files_out:
+    quoted_prefs = shlex.quote(prefs_dir)
+    files_out = adb_su(
+        f"if [ -d {quoted_prefs} ]; then ls {quoted_prefs} 2>/dev/null; fi",
+        timeout=10,
+    )
+    _require_runtime_command(
+        files_out, "listing SharedPreferences", partial_findings=findings
+    )
+    if "No such file" not in files_out:
         for fname in files_out.splitlines():
             fname = fname.strip()
             if not fname or not fname.endswith(".xml"):
                 continue
             content = adb_su(f"cat {shlex.quote(f'{prefs_dir}/{fname}')} 2>/dev/null", timeout=10)
-            if _is_err(content):
-                continue
+            _require_runtime_command(
+                content, f"reading SharedPreferences {fname}",
+                partial_findings=findings,
+            )
             for val in _find_secret_matches(content):
                 val_lower = val.lower()
                 if re.match(r'eyJ[A-Za-z0-9_-]{10,}', val):
@@ -5521,18 +6075,38 @@ def _runtime_data_check(pkg, launch=True):
     db_files_out = adb_su(
         f"find {shlex.quote(db_dir)} -maxdepth 3 \\( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \\) 2>/dev/null",
         timeout=15)
-    if not _is_err(db_files_out):
+    _require_runtime_command(
+        db_files_out, "enumerating application databases",
+        partial_findings=findings,
+    )
+    if db_files_out:
         for dbf in db_files_out.splitlines():
             dbf = dbf.strip()
             if not dbf:
                 continue
             dbname = os.path.basename(dbf)
             header = adb_su(f"xxd -l 16 {shlex.quote(dbf)} 2>/dev/null", timeout=5)
+            _require_runtime_command(
+                header, f"reading database header for {dbname}",
+                partial_findings=findings,
+            )
+            if not header:
+                raise RuntimeCheckUnavailable(
+                    f"reading database header for {dbname}: no output",
+                    partial_findings=findings,
+                )
             if not header or "5351 4c69 7465" not in header:
                 continue
             tables = adb_su(f"sqlite3 {shlex.quote(dbf)} '.tables' 2>/dev/null", timeout=10)
-            if _is_err(tables) or "not found" in tables:
-                continue
+            _require_runtime_command(
+                tables, f"enumerating tables in {dbname}",
+                partial_findings=findings,
+            )
+            if "not found" in tables.lower():
+                raise RuntimeCheckUnavailable(
+                    f"enumerating tables in {dbname}: sqlite3 is unavailable",
+                    partial_findings=findings,
+                )
             for table in tables.split()[:10]:
                 try:
                     table_ident = _sqlite_identifier(table)
@@ -5541,8 +6115,10 @@ def _runtime_data_check(pkg, launch=True):
                 sample = _sqlite_read(
                     dbf, f"SELECT * FROM {table_ident} LIMIT 5", timeout=5  # nosec B608
                 )
-                if _is_err(sample):
-                    continue
+                _require_runtime_command(
+                    sample, f"reading {dbname}/{table}",
+                    partial_findings=findings,
+                )
                 for val in _find_secret_matches(sample):
                     findings.append(("HIGH", "Secret in DB", f"{dbname}/{table}",
                                      _redact(val[:120])))
@@ -5558,7 +6134,10 @@ def _check_world_readable(pkg):
     """Check for world-readable files in app data directory."""
     findings = []
     out = adb_su(f"find {shlex.quote(f'/data/data/{pkg}')} -perm -o+r -type f 2>/dev/null", timeout=15)
-    if not _is_err(out) and "No such file" not in out:
+    _require_runtime_command(out, "checking world-readable files")
+    if "No such file" in out:
+        raise RuntimeCheckUnavailable("application data directory does not exist")
+    if out:
         paths = [f.strip() for f in out.splitlines() if f.strip()]
         modes = _batch_stat(paths)
         for fpath in paths:
@@ -5574,39 +6153,51 @@ def _probe_exported_components(pkg):
 
     work_dir, decompiled_dir = _pull_and_decompile(pkg)
     if not decompiled_dir:
-        return findings
+        raise RuntimeCheckUnavailable("could not obtain a decompiled APK")
 
     manifest = _parse_manifest(decompiled_dir)
     if not manifest["parsed"]:
-        return findings
+        raise RuntimeCheckUnavailable("could not parse AndroidManifest.xml")
 
     exported = manifest["exported"]
     activities = exported.get("activity", [])
 
-    skip_actions = {"android.intent.action.MAIN"}
-
     for comp in activities:
         name = comp["name"]
         actions = comp.get("actions", [])
-        # Skip if only action is MAIN (the launcher)
-        if actions and all(a in skip_actions for a in actions):
+        categories = comp.get("categories", [])
+        # Skip only a real launcher entry. MAIN without LAUNCHER is still an
+        # externally reachable non-launcher activity that should be probed.
+        if ("android.intent.action.MAIN" in actions
+                and "android.intent.category.LAUNCHER" in categories):
             continue
 
-        adb_shell(f"am force-stop {pkg}", timeout=5)
+        stop_out = adb_shell(f"am force-stop {pkg}", timeout=5)
+        _require_runtime_command(
+            stop_out, f"stopping {pkg}", partial_findings=findings
+        )
         time.sleep(0.3)
 
         cmd = f"am start -n {shlex.quote(f'{pkg}/{name}')}"
         if actions:
             cmd += f" -a {shlex.quote(actions[0])}"
         out = adb_shell(cmd, timeout=10)
+        _require_runtime_command(
+            out, f"launching exported activity {name}",
+            partial_findings=findings,
+        )
 
-        if out and ("Error" in out or "Exception" in out or "SecurityException" in out):
-            findings.append(("PASS", name, "Requires auth or crashed"))
-        elif out and "Warning" in out and "not exported" in out:
+        if "SecurityException" in out or "not exported" in out.lower():
             findings.append(("PASS", name, "Not actually exported"))
+        elif "Error" in out or "Exception" in out:
+            findings.append(("INFO", name,
+                             "Launch failed or activity crashed; access control was not established"))
         else:
             time.sleep(1)
             focus = adb_shell("dumpsys activity activities | grep mResumedActivity", timeout=5)
+            _require_runtime_command(
+                focus, "checking resumed activity", partial_findings=findings
+            )
             if focus and name.split(".")[-1] in focus:
                 findings.append(("MEDIUM", name,
                                  "Externally launchable; authentication requires manual review"))
@@ -5616,30 +6207,44 @@ def _probe_exported_components(pkg):
     return findings
 
 
-def _check_clipboard_leak(pkg, launch=True):
+_NO_CLIPBOARD_BASELINE = object()
+
+
+def _read_clipboard_text():
+    """Read clipboard text without relying on version-specific Binder codes."""
+    dump = adb_su("dumpsys clipboard", timeout=10)
+    _require_runtime_command(dump, "reading clipboard")
+    if not dump:
+        return ""
+    if re.search(r"(?:mPrimaryClip|primary clip)\s*[=:]\s*(?:null|none)",
+                 dump, re.IGNORECASE):
+        return ""
+    match = re.search(r'mPrimaryClip=ClipData\{[^}]*\{T:([^}]+)\}', dump)
+    if match:
+        return match.group(1).strip()
+    # Output varies across Android releases. If a clip exists but this build's
+    # format is unknown, a clean result cannot be asserted.
+    raise RuntimeCheckUnavailable("clipboard output format is unsupported")
+
+
+def _check_clipboard_leak(pkg, launch=True, baseline=_NO_CLIPBOARD_BASELINE):
     """Monitor clipboard after interacting with the app."""
     findings = []
 
     if launch:
-        # Establish a clean baseline only when this helper owns the launch.
-        adb_su("service call clipboard 5 i32 1 s16 com.android.shell 2>/dev/null", timeout=5)
+        baseline = _read_clipboard_text()
         print(f"  {C.DIM}Launching {pkg} for clipboard check...{C.RST}")
-        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null", timeout=10)
+        launch_out = adb_shell(
+            f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null",
+            timeout=10,
+        )
+        _require_app_launch(launch_out, "launching target for clipboard check")
         time.sleep(3)
 
-    clip = adb_su("service call clipboard 2 i32 1 i32 0", timeout=10)
-    clip_text = ""
-    if clip and "Parcel" in clip:
-        parts = re.findall(r"'([^']+)'", clip)
-        if parts:
-            clip_text = "".join(parts).replace(".", "").strip()
+    clip_text = _read_clipboard_text()
 
-    if not clip_text:
-        dump = adb_su("dumpsys clipboard", timeout=10)
-        if dump and "mPrimaryClip" in dump:
-            m_clip = re.search(r'mPrimaryClip=ClipData\{[^}]*\{T:([^}]+)\}', dump)
-            if m_clip:
-                clip_text = m_clip.group(1).strip()
+    if baseline is not _NO_CLIPBOARD_BASELINE and clip_text == baseline:
+        return findings
 
     if clip_text and len(clip_text) > 2:
         if _find_secret_matches(clip_text, per_pattern_limit=1):
@@ -5648,7 +6253,10 @@ def _check_clipboard_leak(pkg, launch=True):
         for plabel, val in pii_hits:
             findings.append(("MEDIUM", f"PII ({plabel}) in clipboard", _redact(val[:120])))
         if not findings:
-            findings.append(("INFO", "Clipboard has content", _redact(clip_text[:120])))
+            label = ("Clipboard changed after launch"
+                     if baseline is not _NO_CLIPBOARD_BASELINE
+                     else "Clipboard has content (no attribution baseline)")
+            findings.append(("INFO", label, _redact(clip_text[:120])))
 
     return findings
 
@@ -5658,20 +6266,32 @@ def _check_logcat_leakage(pkg, launch=True):
     findings = []
 
     if launch:
-        adb_shell("logcat -c", timeout=5)
+        clear_out = adb_shell("logcat -c", timeout=5)
+        _require_runtime_command(clear_out, "clearing logcat")
 
         print(f"  {C.DIM}Launching {pkg} for logcat capture...{C.RST}")
-        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null", timeout=10)
+        launch_out = adb_shell(
+            f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null",
+            timeout=10,
+        )
+        _require_app_launch(launch_out, "launching target for logcat capture")
         time.sleep(5)
 
     # Try to get app PID for filtered capture; fall back to unfiltered
-    pid = adb_shell(f"pidof {pkg}", timeout=5).strip()
-    if pid and pid.isdigit():
+    pid_out = adb_shell(f"pidof {pkg}", timeout=5)
+    _require_runtime_command(pid_out, "resolving target process ID")
+    pids = pid_out.split()
+    if not pids or any(not pid.isdigit() for pid in pids):
+        raise RuntimeCheckUnavailable(
+            "target process is not running; logcat cannot be attributed"
+        )
+    log_chunks = []
+    for pid in pids:
         logs = adb_shell(f"logcat -d -t 2000 --pid={pid}", timeout=15)
-    else:
-        logs = adb_shell("logcat -d -t 2000", timeout=15)
-    if _is_err(logs):
-        return findings
+        _require_runtime_command(logs, f"capturing logcat for PID {pid}")
+        if logs:
+            log_chunks.append(logs)
+    logs = "\n".join(log_chunks)
 
     app_logs = []
     for line in logs.splitlines():
@@ -5731,11 +6351,15 @@ def _check_webview_cache(pkg):
         full_path = f"{data_dir}/{rel_path}"
         quoted_path = shlex.quote(full_path)
         out = adb_su(
-            f"if [ -f {quoted_path} ]; then [ -s {quoted_path} ] && echo EXISTS; "
-            f"else find {quoted_path} -type f -size +0c -print -quit 2>/dev/null; fi",
+            f"if [ -f {quoted_path} ]; then "
+            f"[ -s {quoted_path} ] && echo EXISTS || echo ABSENT; "
+            f"elif [ -d {quoted_path} ]; then "
+            f"find {quoted_path} -type f -size +0c -print -quit 2>/dev/null; "
+            f"else echo ABSENT; fi",
             timeout=5,
         )
-        if not _is_err(out):
+        _require_runtime_command(out, f"checking {cache_label}")
+        if out and out != "ABSENT":
             size_out = adb_su(f"du -sh {quoted_path} 2>/dev/null", timeout=5)
             size = size_out.split()[0] if not _is_err(size_out) and size_out.split() else "?"
             findings.append((cache_label, rel_path, size))
@@ -5753,24 +6377,77 @@ def runtime_security_check(pkg):
     total_high = 0
     total_medium = 0
     total_pass = 0
+    total_inconclusive = 0
+
+    def mark_inconclusive(label, reason):
+        nonlocal total_inconclusive
+        total_inconclusive += 1
+        detail = _terminal_safe(str(reason)).replace("\n", " ").strip()
+        if len(detail) > 180:
+            detail = detail[:177] + "..."
+        print(f"    {C.YELLOW}[INCONCLUSIVE]{C.RST} {label}"
+              f" {C.DIM}-- {detail or 'required data was unavailable'}{C.RST}")
+
+    # A failed transport must stop the scan before any empty helper result can
+    # be mistaken for evidence that the app is safe.
+    device_probe = adb_shell("getprop ro.build.version.sdk", timeout=10)
+    if (_command_failed(device_probe)
+            or not str(device_probe or "").strip().isdigit()):
+        mark_inconclusive("Device preflight", device_probe or "no SDK response")
+        print(f"\n  {C.CYAN}{'='*56}{C.RST}")
+        print(f"  {C.BOLD}RUNTIME SECURITY SUMMARY{C.RST}")
+        print(f"  {C.RED}{C.BOLD}CRITICAL: 0{C.RST}  {C.RED}HIGH: 0{C.RST}  "
+              f"{C.YELLOW}MEDIUM: 0{C.RST}  {C.GREEN}PASS: 0{C.RST}  "
+              f"{C.YELLOW}INCONCLUSIVE: {total_inconclusive}{C.RST}")
+        print(f"\n  {C.YELLOW}{C.BOLD}Overall: INCONCLUSIVE -- device unavailable; no security conclusion was made{C.RST}")
+        pause()
+        return
+
+    root_probe = adb_su("id", timeout=10)
+    root_ready = not _command_failed(root_probe) and "uid=0" in root_probe
+
+    clipboard_baseline = _NO_CLIPBOARD_BASELINE
+    clipboard_baseline_error = None
+    if root_ready:
+        try:
+            clipboard_baseline = _read_clipboard_text()
+        except Exception as exc:
+            clipboard_baseline_error = exc
+
+    logcat_clear = adb_shell("logcat -c", timeout=5)
+    logcat_ready = not _command_failed(logcat_clear)
+    logcat_error = logcat_clear if not logcat_ready else None
+
+    print(f"  {C.DIM}Launching {pkg}...{C.RST}")
+    launch_out = adb_shell(
+        f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null",
+        timeout=10,
+    )
+    try:
+        _require_app_launch(launch_out)
+        launch_ready = True
+    except RuntimeCheckUnavailable:
+        launch_ready = False
+    if launch_ready:
+        print(f"  {C.DIM}Waiting 5 seconds for app to initialize...{C.RST}")
+        time.sleep(5)
 
     # ── 1. Data at Rest (Post-Launch) ───────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- Data at Rest (Post-Launch) --{C.RST}")
-    print(f"  {C.DIM}Launching app and scanning for runtime secrets...{C.RST}")
+    print(f"  {C.DIM}Scanning application-private storage for runtime secrets...{C.RST}")
 
-    # Launch the app once for all runtime checks
-    print(f"  {C.DIM}Launching {pkg}...{C.RST}")
-    adb_shell("logcat -c", timeout=5)
-    adb_su("service call clipboard 5 i32 1 s16 com.android.shell 2>/dev/null", timeout=5)
-    adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null", timeout=10)
-    print(f"  {C.DIM}Waiting 5 seconds for app to initialize...{C.RST}")
-    time.sleep(5)
-
-    try:
-        data_findings = _runtime_data_check(pkg, launch=False)
-    except Exception as e:
-        data_findings = []
-        print(f"  {C.RED}[ERROR] Data check failed: {e}{C.RST}")
+    data_available = root_ready
+    data_error = None
+    data_findings = []
+    if not root_ready:
+        data_error = "root access is unavailable"
+    else:
+        try:
+            data_findings = _runtime_data_check(pkg, launch=False)
+        except Exception as exc:
+            data_findings = list(getattr(exc, "partial_findings", []))
+            data_available = False
+            data_error = exc
 
     if data_findings:
         for sev, dlabel, source, val in data_findings:
@@ -5788,18 +6465,28 @@ def runtime_security_check(pkg):
             report.add_finding("Runtime: Data at Rest", f"{dlabel} in {source}",
                                sev, "HIGH", f"Runtime secret found: {display_val}",
                                "Remove secrets from SharedPrefs/databases", "MASVS-STORAGE-1", "CWE-312")
-    else:
+    if not data_available:
+        mark_inconclusive("Data-at-rest check", data_error)
+    elif not launch_ready:
+        mark_inconclusive("Post-launch data coverage", launch_out)
+    elif not data_findings:
         total_pass += 1
         print(f"    {C.GREEN}[PASS]{C.RST} No runtime secrets detected in SharedPrefs/databases")
 
     # ── 2. File Permissions ─────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- File Permissions --{C.RST}")
     print(f"  {C.DIM}Checking for world-readable files...{C.RST}")
-    try:
-        perm_findings = _check_world_readable(pkg)
-    except Exception as e:
-        perm_findings = []
-        print(f"  {C.RED}[ERROR] Permission check failed: {e}{C.RST}")
+    perm_available = root_ready
+    perm_error = None
+    perm_findings = []
+    if not root_ready:
+        perm_error = "root access is unavailable"
+    else:
+        try:
+            perm_findings = _check_world_readable(pkg)
+        except Exception as exc:
+            perm_available = False
+            perm_error = exc
 
     if perm_findings:
         total_high += 1
@@ -5811,18 +6498,24 @@ def runtime_security_check(pkg):
         report.add_finding("Runtime: File Permissions", f"World-readable files: {len(perm_findings)}",
                            "HIGH", "HIGH", "Files in app data directory are world-readable",
                            "Set proper file permissions (0600/0660)", "MASVS-STORAGE-2", "CWE-276")
-    else:
+    elif perm_available:
         total_pass += 1
         print(f"    {C.GREEN}[PASS]{C.RST} No world-readable files found")
+    else:
+        mark_inconclusive("File-permission check", perm_error)
 
     # ── 3. Exported Component Probing ───────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- Exported Components --{C.RST}")
     print(f"  {C.DIM}Probing exported activities for auth bypass...{C.RST}")
+    comp_available = True
+    comp_error = None
+    comp_findings = []
     try:
         comp_findings = _probe_exported_components(pkg)
-    except Exception as e:
-        comp_findings = []
-        print(f"  {C.RED}[ERROR] Component probing failed: {e}{C.RST}")
+    except Exception as exc:
+        comp_findings = list(getattr(exc, "partial_findings", []))
+        comp_available = False
+        comp_error = exc
 
     if comp_findings:
         for sev, cname, detail in comp_findings:
@@ -5841,17 +6534,31 @@ def runtime_security_check(pkg):
                 print(f"    {C.GREEN}[PASS]{C.RST} {short_name} {C.DIM}-- {detail}{C.RST}")
             else:
                 print(f"    {C.BLUE}[INFO]{C.RST} {short_name} {C.DIM}-- {detail}{C.RST}")
-    else:
+    elif comp_available:
         print(f"    {C.DIM}No non-launcher exported activities to probe{C.RST}")
+    else:
+        mark_inconclusive("Exported-component probe", comp_error)
 
     # ── 4. Clipboard Leakage ────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- Clipboard Leakage --{C.RST}")
     print(f"  {C.DIM}Checking clipboard after app launch...{C.RST}")
-    try:
-        clip_findings = _check_clipboard_leak(pkg, launch=False)
-    except Exception as e:
-        clip_findings = []
-        print(f"  {C.RED}[ERROR] Clipboard check failed: {e}{C.RST}")
+    clip_available = root_ready and launch_ready and clipboard_baseline_error is None
+    clip_error = None
+    clip_findings = []
+    if not root_ready:
+        clip_error = "root access is unavailable"
+    elif not launch_ready:
+        clip_error = f"target launch failed: {launch_out}"
+    elif clipboard_baseline_error is not None:
+        clip_error = clipboard_baseline_error
+    else:
+        try:
+            clip_findings = _check_clipboard_leak(
+                pkg, launch=False, baseline=clipboard_baseline
+            )
+        except Exception as exc:
+            clip_available = False
+            clip_error = exc
 
     if clip_findings:
         for sev, clabel, val in clip_findings:
@@ -5865,18 +6572,35 @@ def runtime_security_check(pkg):
                 print(f"    {C.BLUE}[INFO]{C.RST} {clabel}")
             display_val = val if len(val) <= 60 else val[:57] + "..."
             print(f"      {C.DIM}-> {display_val}{C.RST}")
-    else:
+            if sev in ("HIGH", "MEDIUM"):
+                report.add_finding(
+                    "Runtime: Clipboard Leakage", clabel, sev, "MEDIUM",
+                    f"Sensitive clipboard content appeared after launch: {display_val}",
+                    "Avoid copying sensitive values or clear them promptly",
+                    "MASVS-STORAGE-1", "CWE-200",
+                )
+    elif clip_available:
         total_pass += 1
         print(f"    {C.GREEN}[PASS]{C.RST} No sensitive data found in clipboard")
+    else:
+        mark_inconclusive("Clipboard check", clip_error)
 
     # ── 5. Logcat Leakage ───────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- Logcat Leakage --{C.RST}")
     print(f"  {C.DIM}Capturing logcat during app launch...{C.RST}")
-    try:
-        log_findings = _check_logcat_leakage(pkg, launch=False)
-    except Exception as e:
-        log_findings = []
-        print(f"  {C.RED}[ERROR] Logcat check failed: {e}{C.RST}")
+    log_available = launch_ready and logcat_ready
+    log_error = None
+    log_findings = []
+    if not launch_ready:
+        log_error = f"target launch failed: {launch_out}"
+    elif not logcat_ready:
+        log_error = f"logcat clear failed: {logcat_error}"
+    else:
+        try:
+            log_findings = _check_logcat_leakage(pkg, launch=False)
+        except Exception as exc:
+            log_available = False
+            log_error = exc
 
     if log_findings:
         log_crit = sum(1 for s, *_ in log_findings if s == "CRITICAL")
@@ -5903,18 +6627,26 @@ def runtime_security_check(pkg):
                                "Remove debug logging of sensitive data", "MASVS-STORAGE-1", "CWE-532")
         if len(log_findings) > 15:
             print(f"      {C.DIM}... and {len(log_findings) - 15} more{C.RST}")
-    else:
+    elif log_available:
         total_pass += 1
         print(f"    {C.GREEN}[PASS]{C.RST} No secrets or PII leaked in logcat during launch")
+    else:
+        mark_inconclusive("Logcat check", log_error)
 
     # ── 6. WebView Cache ────────────────────────────────────────────────────
     print(f"\n  {C.YELLOW}{C.BOLD}-- WebView Cache --{C.RST}")
     print(f"  {C.DIM}Checking for WebView cached data...{C.RST}")
-    try:
-        wv_findings = _check_webview_cache(pkg)
-    except Exception as e:
-        wv_findings = []
-        print(f"  {C.RED}[ERROR] WebView cache check failed: {e}{C.RST}")
+    wv_available = root_ready
+    wv_error = None
+    wv_findings = []
+    if not root_ready:
+        wv_error = "root access is unavailable"
+    else:
+        try:
+            wv_findings = _check_webview_cache(pkg)
+        except Exception as exc:
+            wv_available = False
+            wv_error = exc
 
     if wv_findings:
         total_medium += 1
@@ -5924,9 +6656,15 @@ def runtime_security_check(pkg):
         report.add_finding("Runtime: WebView Cache", f"WebView cache present ({len(wv_findings)} items)",
                            "MEDIUM", "HIGH", "Cached web data found in app directory",
                            "Clear WebView cache on app exit or use no-cache headers", "MASVS-STORAGE-2", "CWE-524")
-    else:
+    elif wv_available:
         total_pass += 1
         print(f"    {C.GREEN}[PASS]{C.RST} No WebView cache found")
+    else:
+        mark_inconclusive("WebView-cache check", wv_error)
+
+    cleanup_out = adb_shell(f"am force-stop {pkg}", timeout=5)
+    if _command_failed(cleanup_out):
+        mark_inconclusive("Runtime cleanup", cleanup_out)
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n  {C.CYAN}{'='*56}{C.RST}")
@@ -5934,19 +6672,22 @@ def runtime_security_check(pkg):
     print(f"  {C.RED}{C.BOLD}CRITICAL: {total_critical}{C.RST}  "
           f"{C.RED}HIGH: {total_high}{C.RST}  "
           f"{C.YELLOW}MEDIUM: {total_medium}{C.RST}  "
-          f"{C.GREEN}PASS: {total_pass}{C.RST}")
+          f"{C.GREEN}PASS: {total_pass}{C.RST}  "
+          f"{C.YELLOW}INCONCLUSIVE: {total_inconclusive}{C.RST}")
 
     if total_critical > 0:
-        print(f"\n  {C.RED}{C.BOLD}Overall: CRITICAL RISK -- secrets exposed at runtime{C.RST}")
+        suffix = " (INCOMPLETE COVERAGE)" if total_inconclusive else ""
+        print(f"\n  {C.RED}{C.BOLD}Overall: CRITICAL RISK{suffix} -- secrets exposed at runtime{C.RST}")
     elif total_high > 0:
-        print(f"\n  {C.RED}{C.BOLD}Overall: HIGH RISK -- significant runtime issues found{C.RST}")
+        suffix = " (INCOMPLETE COVERAGE)" if total_inconclusive else ""
+        print(f"\n  {C.RED}{C.BOLD}Overall: HIGH RISK{suffix} -- significant runtime issues found{C.RST}")
     elif total_medium > 0:
-        print(f"\n  {C.YELLOW}{C.BOLD}Overall: MODERATE RISK -- some runtime concerns{C.RST}")
+        suffix = " (INCOMPLETE COVERAGE)" if total_inconclusive else ""
+        print(f"\n  {C.YELLOW}{C.BOLD}Overall: MODERATE RISK{suffix} -- some runtime concerns{C.RST}")
+    elif total_inconclusive > 0:
+        print(f"\n  {C.YELLOW}{C.BOLD}Overall: INCONCLUSIVE -- one or more required checks did not run{C.RST}")
     else:
         print(f"\n  {C.GREEN}{C.BOLD}Overall: LOW RISK -- runtime checks passed{C.RST}")
-
-    # Clean up: force-stop the app after all runtime checks
-    adb_shell(f"am force-stop {pkg}", timeout=5)
 
     pause()
 

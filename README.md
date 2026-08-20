@@ -5,7 +5,7 @@
 ### The Only Android Security Tool You'll Ever Need
 
 **Static analysis. Dynamic analysis. Frida instrumentation. Binary patching.**
-**One tool. One terminal. Zero dependencies.**
+**One tool. One terminal. Zero Python packages.**
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -29,7 +29,7 @@ cd apkAnalyzer
 python3 apkAnalyzer.py
 ```
 
-> **That's it.** No `pip install`. No Docker. No config files. Just plug in a rooted device and go.
+> **That's it.** No `pip install`, Docker, or config files. Install ADB (plus apktool for static scans), connect a rooted device, and go.
 
 <br>
 
@@ -65,7 +65,7 @@ python3 apkAnalyzer.py
   [HIGH]     allowBackup          No exclusion rules defined  (MASVS-STORAGE-1 | CWE-530)
   [PASS]     Cleartext Traffic    usesCleartextTraffic="false"
   [HIGH]     Exported Components  3 activities, 1 provider  (MASVS-PLATFORM-1 | CWE-926)
-  [CRITICAL] Hardcoded Secrets    Found AWS key in config.xml  (MASVS-STORAGE-1 | CWE-798)
+  [CRITICAL] Hardcoded Secrets    Found credential in config.xml (value redacted)  (MASVS-STORAGE-1 | CWE-798)
   [PASS]     Network Security     Custom config with certificate pins
   [HIGH]     APK Signing          v1-only — Janus (CVE-2017-13156)  (MASVS-RESILIENCE-2 | CWE-347)
   ...
@@ -92,11 +92,11 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 🎣 | **38 Frida scripts** ready to inject — SSL bypass, root hiding, crypto monitoring |
 | 🧬 | **Universal bypass script** — SSL + root + anti-tamper in a single file |
 | 🔧 | **Binary patching** — Frida Gadget or LSPatch injection in one command |
-| 📦 | **Zero dependencies** — pure Python stdlib, no pip, no Docker |
+| 📦 | **Zero Python packages** — pure Python stdlib, no pip, no Docker |
 | ⚡ | **Smart caching** — decompile once, reuse across all tools, auto-invalidated when the app updates |
 | 🚀 | **Batched ADB** — storage audit reads ~30 files per round-trip, 50× faster on big apps |
 | 🔌 | **Multi-device support** — pick a device when several are connected, all commands follow |
-| 🔎 | **34 high-signal secret patterns** — catches AWS, Firebase, Stripe, GitHub tokens & more without treating public IDs as secrets |
+| 🔎 | **Structured secret detection** — scans common Android source/config formats while excluding known public identifiers |
 | 🤖 | **Framework-aware** — auto-detects Flutter, React Native, Kotlin and adjusts scans |
 
 <br>
@@ -110,6 +110,20 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 - 🧬 **Reliable Frida patches** — Gadget is injected for the APK's actual ABIs, smali register allocation is valid, downloads are bounded, and the LSPatch JAR is SHA-256 pinned
 - 🔒 **Secret-safe output** — full regex matches are detected correctly and secret/PII values are redacted in findings and reports
 - ✅ **Regression suite** — command transport, manifest defaults, archive extraction, secret matching, and patcher injection are covered by automated tests
+
+<br>
+
+## 🛡️ Reliability and Accuracy Safeguards
+
+- **Failure-safe runtime results** — missing, offline, unauthorized, or disconnected devices and failed root/tool commands are reported as `INCONCLUSIVE`; unavailable evidence is never converted into a pass or a low-risk result
+- **Manifest-aware classification** — omitted SDK defaults, explicit empty permissions, activity aliases, provider path permissions, effective task affinity, and enabled/exported deep-link filters are handled explicitly
+- **Effective network policy** — Android version defaults (including Android 6) and Network Security Config precedence are considered when evaluating cleartext traffic
+- **Bounded secret scanning** — JSON, SharedPreferences XML, properties, source, smali, and other common text formats are scanned up to 500 KB per file; values are redacted in terminal and report output
+- **Public identifiers stay informational** — Firebase/Google Android API keys, AWS access-key IDs, and Twilio Account/API-key SIDs are not reported as credentials by themselves
+- **Safer backup extraction** — symlink output roots, duplicate members, file/directory prefix conflicts, traversal paths, and destination-filesystem case collisions are rejected before any archive member is written
+- **Safer cache and Gadget behavior** — decompile caches are not reused when device fingerprints cannot be verified, and Frida Gadget loading is injected through `<clinit>` without changing an activity's `onCreate` register frame
+
+`PASS` means a check ran with the evidence it required. `INCONCLUSIVE` means the required device, manifest, command, or tool evidence was unavailable. Neither status proves that an application is free of vulnerabilities.
 
 <br>
 
@@ -128,7 +142,7 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 | 9 | **Binary Patcher** | Frida Gadget injection or LSPatch/Xposed embedding ([details below](#-binary-patcher)) |
 | 10 | **Frida Server** | USB/remote mode switching, port forwarding, auto server management |
 | 11 | **Testcases** | Launch exported components with intent actions + extras, clipboard spy, dev URL finder, **adb backup extraction** |
-| 12 | **Runtime Security Check** | ADB-based dynamic analysis: post-launch secret scanning, file permissions, exported component probing, clipboard/logcat leakage, WebView cache |
+| 12 | **Runtime Security Check** | ADB-based dynamic analysis with explicit inconclusive states: post-launch secret scanning, file permissions, exported component probing, clipboard/logcat leakage, WebView cache |
 | r | **Report Export** | Export findings to JSON or HTML with severity badges, MASVS references, and CWE IDs (`--report json\|html`) |
 
 <br>
@@ -138,27 +152,27 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 <details>
 <summary><h2>🔒 Security Scan (19 Checks)</h2></summary>
 
-Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is scored with **CRITICAL / HIGH / MEDIUM / LOW** severity, mapped to **OWASP MASVS v2.0** categories, and tagged with **CWE IDs**. Results also shown as **PASS / FAIL / WARN** with an overall risk summary.
+Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is scored with **CRITICAL / HIGH / MEDIUM / LOW** severity, mapped to **OWASP MASVS v2.0** categories, and tagged with **CWE IDs**. Results are shown as **PASS / FAIL / WARN / INCONCLUSIVE** with an overall risk summary. If the manifest cannot be parsed, manifest-dependent checks are skipped without fabricated passes while bounded code/resource secret scanning continues.
 
 <table>
 <tr><th>Category</th><th>Check</th><th>What It Flags</th></tr>
 <tr><td rowspan="4"><b>Manifest</b></td>
   <td>Debuggable</td><td><code>android:debuggable="true"</code></td></tr>
 <tr><td>allowBackup</td><td>Backup enabled without exclusion rules</td></tr>
-<tr><td>Exported Components</td><td>Non-launcher components exported without strong manifest permissions</td></tr>
+<tr><td>Exported Components</td><td>Non-launcher components exported without a demonstrably strong manifest permission; unknown permission strength is flagged for review</td></tr>
 <tr><td>Dangerous Permissions</td><td>Informational review of CAMERA, LOCATION, SMS, RECORD_AUDIO, etc.</td></tr>
 <tr><td rowspan="3"><b>Network</b></td>
   <td>Cleartext Traffic</td><td>Effective manifest, target-SDK, and network-config policy allows HTTP</td></tr>
 <tr><td>Network Security Config</td><td>Production policy trusts user-installed CAs</td></tr>
 <tr><td>Deeplinks</td><td>Custom URI schemes without validation</td></tr>
 <tr><td rowspan="4"><b>Code</b></td>
-  <td>Data Leakage</td><td>Hardcoded secrets in XML, JSON, YAML, properties</td></tr>
+  <td>Data Leakage</td><td>Hardcoded secrets in bounded XML, JSON, properties, environment, source, smali, and related text files</td></tr>
 <tr><td>WebView JS Interface</td><td><code>addJavascriptInterface()</code> — XSS risk on SDK &lt; 17</td></tr>
 <tr><td>Debug Logging</td><td><code>Log.v/d</code>, Timber, <code>console.log</code>, <code>debugPrint</code> in production</td></tr>
 <tr><td>Broadcast Security</td><td><code>sendBroadcast()</code> without permission</td></tr>
 <tr><td rowspan="4"><b>UI / Input</b></td>
   <td>FLAG_SECURE</td><td>Informational review for sensitive screens</td></tr>
-<tr><td>Clipboard Exposure</td><td><code>ClipboardManager</code> without <code>FLAG_SENSITIVE</code></td></tr>
+<tr><td>Clipboard Exposure</td><td>Clipboard reads and writes that require manual exposure review</td></tr>
 <tr><td>Keyboard Cache</td><td>Password input types and keyboard-learning hints</td></tr>
 <tr><td>Tapjacking</td><td>Informational review of sensitive confirmation views</td></tr>
 <tr><td rowspan="4"><b>Platform</b></td>
@@ -171,18 +185,18 @@ Static analysis of the decompiled APK and AndroidManifest.xml. Each finding is s
 </details>
 
 <details>
-<summary><h2>🔑 Secret Detection (34 Patterns)</h2></summary>
+<summary><h2>🔑 Secret Detection</h2></summary>
 
-Both **Storage Audit** and **Security Scan** use 34 high-signal regex patterns to catch hardcoded secrets. Public certificates, publishable Stripe keys, OAuth client IDs, and endpoint URLs are intentionally not classified as secrets.
+Both **Storage Audit** and **Security Scan** use structured, bounded matching rules to catch hardcoded credentials. Known public identifiers, public certificates, publishable Stripe keys, OAuth client IDs, and endpoint URLs are intentionally not classified as secrets. Matching values and detected PII are redacted before terminal/report previews are produced.
 
 | Provider | Patterns |
 |----------|----------|
 | **Generic** | Passwords, API keys, tokens, JWTs, bearer tokens, encryption keys |
-| **AWS** | `AKIA` access keys, secret keys, session tokens |
-| **Google / Firebase** | `AIza` keys, Firebase tokens and secrets |
+| **AWS** | Secret access keys and session tokens; `AKIA` access-key IDs alone are excluded |
+| **Google / Firebase** | Assigned Firebase credentials and secrets; public `AIza` Android API keys are excluded |
 | **Azure** | Storage keys, connection strings, client secrets |
 | **Stripe / Payment** | `sk_live_`, `rk_live_`, PayPal, Braintree, Razorpay secrets |
-| **Messaging** | Twilio, SendGrid, Slack tokens, webhook URLs |
+| **Messaging** | Twilio auth tokens, SendGrid and Slack tokens, webhook URLs; Twilio Account/API-key SIDs are excluded |
 | **GitHub** | `ghp_`/`ghs_` PATs, fine-grained tokens |
 | **Database** | MongoDB, Postgres, MySQL, Redis connection strings |
 | **Crypto** | PEM private keys |
@@ -309,6 +323,28 @@ Or use the `[r] Export Report` menu option during an interactive session. HTML r
 ./backups/             ← adb backup .ab files + unpacked app data
 ./.gadget_cache/       ← Cached Frida Gadget & LSPatch jar
 ./.apkanalyzer_tmp/    ← Decompiled APK cache (reused across scans)
+```
+
+---
+
+## 🧪 Regression Tests
+
+The runtime application uses only the Python standard library. Run the full regression suite with Python 3.8 or newer:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+If `pytest` is installed, the equivalent concise run is:
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+The suite uses deterministic ADB/tool mocks and temporary APK/backup fixtures, so it does not require a connected Android device. To syntax-check the bundled universal Frida script when Node.js is available:
+
+```bash
+node --check frida_scripts/universal_bypass.js
 ```
 
 ---
