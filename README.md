@@ -34,7 +34,7 @@ Local static scans need Python 3.8+ and apktool, but do **not** need ADB, root,
 or a connected device. The command accepts a single `.apk`, an `.apks` set, an
 `.aab` (with bundletool), or a directory containing split APKs.
 
-Release downloads provide `apkAnalyzer-v1.7.0.zip` and its SHA-256 checksum.
+Release downloads provide `apkAnalyzer-v1.7.1.zip` and its SHA-256 checksum.
 Extract the complete ZIP: the launcher now depends on the included
 `apk_analyzer/` package and is no longer a standalone single-file script.
 
@@ -120,7 +120,15 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 
 <br>
 
-## 🆕 What's New in v1.7.0
+## 🆕 What's New in v1.7.1
+
+- **Accurate session reports** — switching apps clears previous findings and incomplete-coverage warnings; clean and inconclusive results can be exported even with no findings
+- **Complete finding evidence** — repeated findings preserve source locations and severity upgrades with their associated confidence
+- **Consistent file reads** — detected changes during static code, secret, and XML reads prevent complete-coverage claims; secret scanning finalizes text windows at confirmed end of file
+- **Encoding-aware XML validation** — DTD/entity declarations are rejected across supported encodings while harmless declaration-like text in comments and CDATA remains valid
+- **Regression coverage** — 17 new tests cover report lifecycle, finding aggregation, file-read consistency, and XML parsing
+
+### Previous release: v1.7.0
 
 - 🧰 **Headless local and CI scanning** — analyze `.apk`, `.apks`, `.aab`, or split-APK directories without ADB; export JSON, HTML, or SARIF and enforce a severity threshold with `--fail-on`
 - 🧩 **Compatibility-preserving modules** — the launcher remains `apkAnalyzer.py`, while archive, input, process, reporting, resource, secret, and rule logic now lives in testable `apk_analyzer/` modules
@@ -136,6 +144,8 @@ Most Android security tools do **one thing** — a static scanner, a Frida wrapp
 
 ## 🛡️ Reliability and Accuracy Safeguards
 
+- **Consistent session reports** — switching apps clears that app's findings, metadata, and incomplete-coverage warnings; clean and inconclusive results can be exported even when there are no findings. Repeated findings retain source locations and the highest observed severity with its associated confidence.
+- **Read consistency and XML parsing** — static code, secret, and XML readers check file identity and metadata around reads; detected changes prevent complete-coverage claims. DTD/entity declarations are rejected by the parser across supported encodings while declaration-like text in comments or CDATA remains valid.
 - **Failure-safe runtime results** — missing, offline, unauthorized, or disconnected devices and failed root/tool commands are reported as `INCONCLUSIVE`; unavailable evidence is never converted into a pass or a low-risk result
 - **Manifest-aware classification** — omitted SDK defaults, explicit empty permissions, activity aliases, provider path permissions, effective task affinity, and enabled/exported deep-link filters are handled explicitly
 - **Effective network policy** — Android version defaults (including Android 6) and Network Security Config precedence are considered when evaluating cleartext traffic

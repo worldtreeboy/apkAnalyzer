@@ -9265,9 +9265,9 @@ def main_menu(device_info, has_root, selected_pkg):
 def export_report_menu():
     """Interactive menu to export collected findings as JSON or HTML."""
     section("EXPORT REPORT")
-    if not report.findings:
-        print(f"\n  {C.YELLOW}[!] No findings collected yet.{C.RST}")
-        print(f"  {C.DIM}Run a Security Scan (option 5) first to collect findings.{C.RST}")
+    if not report.has_results:
+        print(f"\n  {C.YELLOW}[!] No analysis results collected yet.{C.RST}")
+        print(f"  {C.DIM}Run a Security Scan (option 5) first to collect results.{C.RST}")
         pause()
         return
 
@@ -9528,7 +9528,7 @@ def _run_headless_scan(args):
 def _run_interactive(args):
     """Run the legacy device UI and optional post-session report export."""
     main()
-    if args.report and report.findings:
+    if args.report and report.has_results:
         out_path = args.legacy_output
         if not out_path:
             out_path = (
@@ -9612,7 +9612,7 @@ def main():
         print(f"  {C.DIM}Like this tool? Star it: {C.WHITE}https://github.com/worldtreeboy/apkAnalyzer{C.RST}\n")
         return
 
-    report.target_app = selected_pkg
+    report.reset_app(selected_pkg)
 
     # Options that require a selected app
     APP_REQUIRED = {"1", "2", "5", "7", "8", "9", "11", "12"}
@@ -9631,9 +9631,7 @@ def main():
             new_pkg = pick_app(apps)
             if new_pkg:
                 selected_pkg = new_pkg
-                report.target_app = new_pkg
-                report.findings.clear()
-                report.app_info.clear()
+                report.reset_app(new_pkg)
             continue
 
         if choice.lower() == "r":

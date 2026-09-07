@@ -27,6 +27,22 @@ def is_link_or_reparse_stat(path_stat):
     return bool(attributes & reparse_flag)
 
 
+def file_stat_signature(path_stat):
+    """Identify a file and detect ordinary content changes during a read."""
+    return (
+        path_stat.st_dev, path_stat.st_ino, path_stat.st_size,
+        getattr(path_stat, "st_mtime_ns", path_stat.st_mtime),
+        getattr(path_stat, "st_ctime_ns", path_stat.st_ctime),
+    )
+
+
+class _NoDoctypeTreeBuilder(ET.TreeBuilder):
+    """Reject document type declarations regardless of the XML encoding."""
+
+    def doctype(self, name, pubid, system):
+        raise ValueError("DTD/entity declarations are not allowed")
+
+
 def terminal_safe(value):
     """Strip terminal control sequences from untrusted device/app output."""
     text = str(value)
@@ -73,17 +89,17 @@ def safe_parse_xml(path, max_bytes=MAX_XML_BYTES):
         with os.fdopen(descriptor, "rb") as fh:
             descriptor = None
             data = fh.read(max_bytes + 1)
+            final_stat = os.fstat(fh.fileno())
     finally:
         if descriptor is not None:
             os.close(descriptor)
     if len(data) > max_bytes:
         raise ValueError(f"XML file exceeds {max_bytes} byte safety limit")
-    upper = data.upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
-        raise ValueError("DTD/entity declarations are not allowed")
-    # ElementTree is safe here because DTD/entities are rejected and input is
-    # bounded.
-    return ET.ElementTree(ET.fromstring(data))  # nosec B314
+    if (file_stat_signature(source_stat) != file_stat_signature(final_stat)
+            or len(data) != source_stat.st_size):
+        raise ValueError("XML input changed during read")
+    parser = ET.XMLParser(target=_NoDoctypeTreeBuilder())
+    return ET.ElementTree(ET.fromstring(data, parser=parser))  # nosec B314
 
 
 def is_valid_package(package):

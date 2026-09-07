@@ -7,9 +7,74 @@ from pathlib import Path
 
 import apkAnalyzer as analyzer
 from apk_analyzer import reporting
+from apk_analyzer import cli
 
 
 class ReportingModuleTests(unittest.TestCase):
+    def test_repeated_finding_merges_stronger_evidence_and_locations(self):
+        collector = reporting.ReportCollector()
+        for severity, confidence, path in (
+                ("LOW", "LOW", "res/xml/first.xml"),
+                ("HIGH", "HIGH", "res/xml/second.xml"),
+                ("LOW", "LOW", "res/xml/first.xml")):
+            collector.add_finding(
+                "Configuration", "Policy", severity, confidence,
+                "Policy requires review", rule_id="policy",
+                locations=[{"path": path, "line": 1}],
+                remediation="Review the policy" if severity == "HIGH" else "",
+            )
+
+        self.assertEqual(len(collector.findings), 1)
+        finding = collector.findings[0]
+        self.assertEqual(finding["severity"], "HIGH")
+        self.assertEqual(finding["confidence"], "HIGH")
+        self.assertEqual(finding["remediation"], "Review the policy")
+        self.assertEqual(len(finding["locations"]), 2)
+        self.assertEqual(cli.scan_exit_code(collector, "high"), cli.EXIT_FINDINGS)
+        result = collector._build_sarif_dict()["runs"][0]["results"][0]
+        self.assertEqual(result["level"], "error")
+        self.assertEqual(len(result["locations"]), 2)
+
+    def test_different_rules_with_identical_text_remain_separate(self):
+        collector = reporting.ReportCollector()
+        for rule_id in ("first_rule", "second_rule"):
+            collector.add_finding(
+                "Configuration", "Policy", "LOW", "LOW", "Review policy",
+                rule_id=rule_id,
+            )
+        self.assertEqual(len(collector.findings), 2)
+
+    def test_merged_confidence_belongs_to_the_retained_severity(self):
+        for observations in (
+                (("LOW", "HIGH"), ("HIGH", "LOW")),
+                (("HIGH", "LOW"), ("LOW", "HIGH"))):
+            with self.subTest(observations=observations):
+                collector = reporting.ReportCollector()
+                for severity, confidence in observations:
+                    collector.add_finding(
+                        "Configuration", "Policy", severity, confidence,
+                        "Review policy", rule_id="policy",
+                    )
+                self.assertEqual(collector.findings[0]["severity"], "HIGH")
+                self.assertEqual(collector.findings[0]["confidence"], "LOW")
+
+    def test_reset_app_clears_all_app_state_and_keeps_device(self):
+        collector = reporting.ReportCollector()
+        collector.device_info = {"serial": "device-1"}
+        collector.target_app = "com.example.first"
+        collector.app_info["version"] = "1"
+        collector.add_finding("Category", "Title", "LOW", "LOW", "text")
+        collector.mark_inconclusive("check", "old app unavailable")
+
+        collector.reset_app("com.example.second")
+
+        self.assertEqual(collector.target_app, "com.example.second")
+        self.assertEqual(collector.device_info, {"serial": "device-1"})
+        self.assertEqual(collector.findings, [])
+        self.assertEqual(collector.app_info, {})
+        self.assertEqual(collector.inconclusive, [])
+        self.assertFalse(collector.has_results)
+
     def test_legacy_module_reexports_reporting_api_and_singleton(self):
         self.assertIs(analyzer.ReportCollector, reporting.ReportCollector)
         self.assertIs(analyzer.report, reporting.report)

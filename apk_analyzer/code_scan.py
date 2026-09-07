@@ -9,7 +9,7 @@ import os
 import stat
 from dataclasses import dataclass, field
 
-from .safety import is_link_or_reparse_stat
+from .safety import file_stat_signature, is_link_or_reparse_stat
 
 
 DEFAULT_CHUNK_BYTES = 256 * 1024
@@ -201,6 +201,7 @@ def read_file(path, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
             # exact-budget files without retaining or analysing beyond budget.
             if not reached_eof and outcome.size <= max_bytes:
                 reached_eof = not bool(source.read(1))
+            final_stat = os.fstat(source.fileno())
     except OSError as exc:
         outcome.content = b"".join(chunks).decode(
             "utf-8", errors="replace"
@@ -210,14 +211,17 @@ def read_file(path, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
         return outcome
 
     outcome.content = b"".join(chunks).decode("utf-8", errors="replace")
-    outcome.complete = reached_eof or outcome.bytes_scanned >= outcome.size
-    # A file known to exceed the read allowance is partial even if it was
-    # truncated or replaced between fstat and the first read.
-    if outcome.size > max_bytes:
-        outcome.complete = False
+    unchanged = (
+        file_stat_signature(source_stat) == file_stat_signature(final_stat)
+    )
+    outcome.complete = (
+        reached_eof and unchanged and outcome.bytes_scanned == outcome.size
+    )
     if not outcome.complete:
         outcome.status = "partial"
-        outcome.reason = "byte budget exhausted"
+        outcome.reason = (
+            "byte budget exhausted" if unchanged else "file changed during read"
+        )
     return outcome
 
 

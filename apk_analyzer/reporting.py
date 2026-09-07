@@ -137,12 +137,31 @@ class ReportCollector:
     def add_finding(self, category, title, severity, confidence, description,
                     remediation="", masvs="", cwe="", rule_id="",
                     locations=None):
-        # Skip exact duplicates (same category/title/description) so re-running
-        # a scan doesn't record the same finding twice.
+        rule_id = rule_id or _fallback_rule_id(category, title)
+        locations = [dict(location) for location in (locations or [])]
+        # Repeated observations of a rule share one finding, but can add
+        # locations or stronger evidence. Never discard a severity upgrade.
         for finding in self.findings:
             if (finding["category"] == category
                     and finding["title"] == title
-                    and finding["description"] == description):
+                    and finding["description"] == description
+                    and finding["rule_id"] == rule_id):
+                if self.SEVERITY_ORDER.get(severity, 99) < self.SEVERITY_ORDER.get(
+                        finding["severity"], 99):
+                    finding["severity"] = severity
+                    finding["confidence"] = confidence
+                confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+                if (severity == finding["severity"]
+                        and confidence_order.get(confidence, 99)
+                        < confidence_order.get(finding["confidence"], 99)):
+                    finding["confidence"] = confidence
+                for location in locations:
+                    if location not in finding["locations"]:
+                        finding["locations"].append(location)
+                for key, value in (("remediation", remediation),
+                                   ("masvs", masvs), ("cwe", cwe)):
+                    if value and not finding[key]:
+                        finding[key] = value
                 return
         self.findings.append({
             "category": category,
@@ -153,8 +172,8 @@ class ReportCollector:
             "remediation": remediation,
             "masvs": masvs,
             "cwe": cwe,
-            "rule_id": rule_id or _fallback_rule_id(category, title),
-            "locations": list(locations or []),
+            "rule_id": rule_id,
+            "locations": locations,
             "timestamp": now_iso(),
         })
 
@@ -167,14 +186,23 @@ class ReportCollector:
         if item not in self.inconclusive:
             self.inconclusive.append(item)
 
-    def reset(self):
-        """Clear session state while retaining this shared collector object."""
-        self.device_info.clear()
-        self.target_app = ""
+    @property
+    def has_results(self):
+        """Include clean analysis metadata and incomplete checks in exports."""
+        return bool(self.findings or self.inconclusive or self.app_info)
+
+    def reset_app(self, target_app=""):
+        """Start an application's report while retaining the selected device."""
+        self.target_app = target_app
         self.findings.clear()
         self.app_info.clear()
         self.inconclusive.clear()
         self.timestamp = now_iso()
+
+    def reset(self):
+        """Clear session state while retaining this shared collector object."""
+        self.device_info.clear()
+        self.reset_app()
 
     def _build_report_dict(self):
         sorted_findings = sorted(

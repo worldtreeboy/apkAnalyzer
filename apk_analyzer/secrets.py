@@ -5,7 +5,7 @@ import os
 import stat
 from dataclasses import dataclass, field
 
-from .safety import is_link_or_reparse_stat
+from .safety import file_stat_signature, is_link_or_reparse_stat
 
 
 DEFAULT_CHUNK_BYTES = 256 * 1024
@@ -165,6 +165,12 @@ def scan_file(path, matcher, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
             outcome.status = "skipped"
             outcome.reason = "not a regular file"
             return outcome
+        if not os.path.samestat(path_stat, source_stat):
+            os.close(descriptor)
+            descriptor = None
+            outcome.status = "skipped"
+            outcome.reason = "file changed during open"
+            return outcome
         outcome.size = source_stat.st_size
         source = os.fdopen(descriptor, "rb")
         descriptor = None
@@ -177,6 +183,7 @@ def scan_file(path, matcher, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
     carry = ""
+    last_window = ""
     reached_eof = False
     try:
         with source:
@@ -190,19 +197,22 @@ def scan_file(path, matcher, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
                 outcome.bytes_scanned += len(raw)
                 if not outcome.matched:
                     text = carry + decoder.decode(raw, final=False)
-                    final_window = outcome.bytes_scanned >= outcome.size
                     try:
-                        outcome.matched = bool(matcher(text, final_window))
+                        outcome.matched = bool(matcher(text, False))
                     except Exception as exc:
                         outcome.status = "unreadable"
                         outcome.reason = f"matcher {type(exc).__name__}"
                         return outcome
                     carry = text[-overlap_chars:] if overlap_chars else ""
+                    last_window = text
 
+            if not reached_eof and outcome.size <= max_bytes:
+                reached_eof = not bool(source.read(1))
+            final_stat = os.fstat(source.fileno())
             if not outcome.matched and reached_eof:
                 tail = decoder.decode(b"", final=True)
                 try:
-                    outcome.matched = bool(matcher(carry + tail, True))
+                    outcome.matched = bool(matcher(last_window + tail, True))
                 except Exception as exc:
                     outcome.status = "unreadable"
                     outcome.reason = f"matcher {type(exc).__name__}"
@@ -212,10 +222,17 @@ def scan_file(path, matcher, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
         outcome.reason = type(exc).__name__
         return outcome
 
-    outcome.complete = reached_eof or outcome.bytes_scanned >= outcome.size
+    unchanged = (
+        file_stat_signature(source_stat) == file_stat_signature(final_stat)
+    )
+    outcome.complete = (
+        reached_eof and unchanged and outcome.bytes_scanned == outcome.size
+    )
     if not outcome.complete:
         outcome.status = "partial"
-        outcome.reason = "byte budget exhausted"
+        outcome.reason = (
+            "byte budget exhausted" if unchanged else "file changed during read"
+        )
     return outcome
 
 
