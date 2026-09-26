@@ -4,7 +4,7 @@
 
 ### Know what ships inside your APK.
 
-Static findings you can verify, plus an optional device workflow when you need one.
+A static scan of the package, and a dynamic scan on a connected device.
 
 [![Download latest release](https://img.shields.io/badge/Download-latest_release-2ea44f?style=for-the-badge)](https://github.com/worldtreeboy/apkAnalyzer/releases/latest)
 [![Star on GitHub](https://img.shields.io/badge/Star_on_GitHub-facc15?style=for-the-badge&logo=github&logoColor=black)](https://github.com/worldtreeboy/apkAnalyzer)
@@ -17,7 +17,7 @@ Windows · Linux · WSL · macOS
 
 </div>
 
-APK Analyzer reviews `.apk`, `.apks`, `.aab`, and split-APK directories. Each finding has severity, confidence, remediation, and a MASVS or CWE reference. Missing evidence is `INCONCLUSIVE`, not a pass.
+APK Analyzer reviews `.apk`, `.apks`, `.aab`, and split-APK directories. `scan` is static and does not use a device. The dynamic scan is menu `12`: it launches the installed app over `adb`. Each finding has severity, confidence, remediation, and a MASVS or CWE reference. Missing evidence is `INCONCLUSIVE`, not a pass.
 
 No third-party Python packages. Run `apkAnalyzer.py` and keep it next to `apk_analyzer/`.
 
@@ -36,7 +36,9 @@ On Windows, use `python` if `python3` is not the command. Omit `--output` to wri
 | JSON | `python3 apkAnalyzer.py scan --apk app.apk --format json --output report.json` |
 | CI | `python3 apkAnalyzer.py scan --apk app.apk --format sarif --output report.sarif --fail-on high` |
 | App Bundle | `python3 apkAnalyzer.py scan --apk app.aab --bundletool /path/to/bundletool.jar --format html --output report.html` |
-| Device | `python3 apkAnalyzer.py` |
+| Dynamic scan | `python3 apkAnalyzer.py`, then `12` |
+
+Exit codes below are for `scan` only. The dynamic scan is interactive and does not use them.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -55,7 +57,7 @@ Exit code `2` wins over a clean finding count, so a partial scan cannot pass CI.
 | WebView | JavaScript bridge, file access, debugging, mixed content |
 | Code | PendingIntent flags, unprotected broadcasts, debug logging |
 | Data | Live secrets versus generic assignments, clipboard, keyboard cache, screenshots |
-| Device | Storage, logcat, runtime checks, screenshots. Root and Frida are optional |
+| Dynamic scan | After launch: private storage, world-readable files, exported activities, clipboard, logcat, WebView cache |
 
 A few rules that change the result:
 
@@ -78,10 +80,10 @@ Connect a phone with USB debugging and `adb` on `PATH`.
 | `3` | Shell | `9` | Gadget or LSPatch patcher |
 | `4` | Screenshot | `10` | Frida server |
 | `5` | Security scan | `11` | Component, clipboard, and URL probes |
-| `6` | Keyboard cache | `12` | Runtime checks |
+| `6` | Keyboard cache | `12` | Dynamic scan |
 | `a` | Switch app | `r` | Export JSON or HTML |
 
-Patching applies to a single APK, not a split install. Runtime checks may launch the app. Without root, storage and clipboard checks stay inconclusive.
+Menu `12` is the dynamic scan. It launches the selected app, checks private storage, world-readable files, exported activities, the clipboard, logcat, and the WebView cache, then force-stops the app. Storage, file permissions, clipboard, and WebView cache need root and stay inconclusive without it. Logcat and exported activities do not. Patching applies to a single APK, not a split install.
 
 ## Requirements
 
@@ -91,8 +93,9 @@ Patching applies to a single APK, not a split install. Runtime checks may launch
 | [apktool](https://apktool.org/docs/install/) and Java | Decoding packages |
 | `apksigner` | Signing check on a single APK |
 | [bundletool](https://developer.android.com/tools/bundletool) | `.aab` input |
-| `adb` | Device mode |
-| Root, `frida-tools`, `frida-server` | Optional runtime and hooking features |
+| `adb` | Dynamic scan and the device menu |
+| Root | Storage, file permissions, clipboard, and WebView cache in the dynamic scan |
+| `frida-tools`, `frida-server` | Optional hooking. Not required for the dynamic scan |
 
 Put the tools you use on `PATH`. On Windows, a nearby `.jar` is launched with `java -jar`. `.bat` and `.cmd` wrappers are not. A missing tool makes that check inconclusive.
 
