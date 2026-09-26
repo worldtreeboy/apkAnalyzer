@@ -195,16 +195,18 @@ def scan_file(path, matcher, *, max_bytes=DEFAULT_MAX_FILE_BYTES,
                     reached_eof = True
                     break
                 outcome.bytes_scanned += len(raw)
-                if not outcome.matched:
-                    text = carry + decoder.decode(raw, final=False)
-                    try:
-                        outcome.matched = bool(matcher(text, False))
-                    except Exception as exc:
-                        outcome.status = "unreadable"
-                        outcome.reason = f"matcher {type(exc).__name__}"
-                        return outcome
-                    carry = text[-overlap_chars:] if overlap_chars else ""
-                    last_window = text
+                # Keep calling the matcher after the first hit. Callers use
+                # later windows to tell a generic assignment from a live key.
+                text = carry + decoder.decode(raw, final=False)
+                try:
+                    if matcher(text, False):
+                        outcome.matched = True
+                except Exception as exc:
+                    outcome.status = "unreadable"
+                    outcome.reason = f"matcher {type(exc).__name__}"
+                    return outcome
+                carry = text[-overlap_chars:] if overlap_chars else ""
+                last_window = text
 
             if not reached_eof and outcome.size <= max_bytes:
                 reached_eof = not bool(source.read(1))

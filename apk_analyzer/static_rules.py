@@ -503,6 +503,639 @@ def analyze_clipboard_writes(smali_text, lookback=160):
     return writes
 
 
+_WEBVIEW_BOOL_SETTINGS = {
+    ("Landroid/webkit/WebSettings;", "setAllowFileAccess"): "file_access",
+    ("Landroid/webkit/WebSettings;", "setAllowFileAccessFromFileURLs"): (
+        "file_url_access"
+    ),
+    ("Landroid/webkit/WebSettings;", "setAllowUniversalAccessFromFileURLs"): (
+        "universal_file_access"
+    ),
+    ("Landroid/webkit/WebView;", "setWebContentsDebuggingEnabled"): "debugging",
+}
+_WEBVIEW_HIGH_SETTINGS = {
+    "file_url_access", "universal_file_access", "debugging",
+}
+# WebSettings.MIXED_CONTENT_ALWAYS_ALLOW is 0. Compatibility mode (2) still
+# permits mixed content and is reported with the always-allow finding.
+_MIXED_CONTENT_RISKY = {0, 2}
+_BROADCAST_METHODS = {"sendBroadcast", "sendBroadcastAsUser"}
+_BACKUP_DOMAINS = ("sharedpref", "database", "file", "root")
+_BACKUP_LEVEL_ORDER = ("open", "databases_excluded", "private_excluded")
+
+
+def analyze_webview_settings(smali_text, lookback=64):
+    """Classify WebView setting calls whose argument can be proven.
+
+    ``state`` is ``enabled``, ``disabled``, or ``unknown``. Only ``enabled``
+    is a finding. A non-constant argument is unknown rather than assumed safe
+    or unsafe.
+    """
+    lines = str(smali_text or "").splitlines()
+    results = []
+    for index, line in enumerate(lines):
+        call = _parse_invoke(line)
+        if not call:
+            continue
+        setting = _WEBVIEW_BOOL_SETTINGS.get((call["owner"], call["method"]))
+        if setting is not None and call["parameters"] == ["Z"]:
+            register = _argument_register(call, 0)
+            lower = _method_lower_bound(lines, index, lookback)
+            value = _resolve_int_constant(lines, index, register, lower)
+            if value == 1:
+                state = "enabled"
+            elif value == 0:
+                state = "disabled"
+            else:
+                state = "unknown"
+            results.append({
+                "line": index + 1,
+                "setting": setting,
+                "state": state,
+            })
+            continue
+        if (call["owner"] == "Landroid/webkit/WebSettings;"
+                and call["method"] == "setMixedContentMode"
+                and call["parameters"] == ["I"]):
+            register = _argument_register(call, 0)
+            lower = _method_lower_bound(lines, index, lookback)
+            value = _resolve_int_constant(lines, index, register, lower)
+            if value in _MIXED_CONTENT_RISKY:
+                state = "enabled"
+            elif value == 1:
+                state = "disabled"
+            else:
+                state = "unknown"
+            results.append({
+                "line": index + 1,
+                "setting": "mixed_content",
+                "state": state,
+                "mode": value,
+            })
+    return results
+
+
+def webview_setting_severity(settings):
+    """Return HIGH when a proven WebView call is a bridge or debugger switch."""
+    enabled = {item["setting"] for item in settings if item["state"] == "enabled"}
+    if enabled & _WEBVIEW_HIGH_SETTINGS:
+        return "HIGH"
+    if enabled:
+        return "MEDIUM"
+    return None
+
+
+def analyze_broadcast_sends(smali_text):
+    """Classify each Context.sendBroadcast call, not the whole file.
+
+    A String permission parameter counts as protected. LocalBroadcastManager
+    sends are in-process and are ignored. The receiver class in smali is often
+    the app Activity, so the method descriptor is matched instead of Context.
+    """
+    lines = str(smali_text or "").splitlines()
+    results = []
+    for index, line in enumerate(lines):
+        call = _parse_invoke(line)
+        if not call or call["method"] not in _BROADCAST_METHODS:
+            continue
+        if "LocalBroadcastManager" in call["owner"]:
+            continue
+        parameters = call["parameters"]
+        if not parameters or parameters[0] != "Landroid/content/Intent;":
+            continue
+        results.append({
+            "line": index + 1,
+            "method": call["method"],
+            "protected": "Ljava/lang/String;" in parameters,
+        })
+    return results
+
+
+def _whole_backup_domain(path):
+    return (path or ".").strip() in {".", "", "/", "*", "./"}
+
+
+def _backup_rules(parent):
+    """Return include/exclude rows, or None when the section is absent."""
+    if parent is None:
+        return None
+    rules = []
+    for child in list(parent):
+        tag = child.tag.split("}")[-1]
+        if tag not in ("include", "exclude"):
+            continue
+        rules.append({
+            "op": tag,
+            "domain": (child.get("domain") or "").strip().lower(),
+            "path": child.get("path"),
+        })
+    return rules
+
+
+def _domain_is_backed_up(rules, domain):
+    includes = [
+        rule for rule in rules
+        if rule["op"] == "include" and rule["domain"] == domain
+    ]
+    excludes = [
+        rule for rule in rules
+        if rule["op"] == "exclude" and rule["domain"] == domain
+    ]
+    full_exclude = any(_whole_backup_domain(rule["path"]) for rule in excludes)
+    if any(rule["op"] == "include" for rule in rules):
+        if not includes or full_exclude:
+            return False
+        return True
+    return not full_exclude
+
+
+def classify_backup_rules(rules):
+    """Return how much private data a rule list still backs up.
+
+    ``open`` means shared preferences or databases can be included.
+    ``databases_excluded`` still allows files or the app root.
+    ``private_excluded`` excludes shared preferences, databases, files, and root.
+    """
+    if rules is None:
+        return None
+    backed = {
+        domain: _domain_is_backed_up(rules, domain)
+        for domain in _BACKUP_DOMAINS
+    }
+    if backed["sharedpref"] or backed["database"]:
+        return "open"
+    if backed["file"] or backed["root"]:
+        return "databases_excluded"
+    return "private_excluded"
+
+
+def _worst_backup_level(levels):
+    present = [level for level in levels if level]
+    if not present:
+        return "open"
+    return min(present, key=_BACKUP_LEVEL_ORDER.index)
+
+
+def classify_backup_xml(root):
+    """Classify one full-backup or data-extraction document.
+
+    Returns ``full`` and/or ``extraction`` levels. A missing device-transfer
+    section inherits cloud-backup, and the reverse. An empty present section
+    does not inherit: it backs up everything.
+    """
+    if root is None:
+        return None
+    tag = root.tag.split("}")[-1]
+    if tag == "full-backup-content":
+        return {"full": classify_backup_rules(_backup_rules(root))}
+    if tag != "data-extraction-rules":
+        return None
+    cloud = root.find("cloud-backup")
+    device = root.find("device-transfer")
+    cloud_rules = _backup_rules(cloud)
+    device_rules = _backup_rules(device)
+    if cloud_rules is None and device_rules is not None:
+        cloud_rules = device_rules
+    elif device_rules is None and cloud_rules is not None:
+        device_rules = cloud_rules
+    elif cloud_rules is None and device_rules is None:
+        return {"extraction": "open"}
+    return {
+        "extraction": _worst_backup_level((
+            classify_backup_rules(cloud_rules),
+            classify_backup_rules(device_rules),
+        )),
+    }
+
+
+def combine_backup_policy(min_level, target_level, full_level, extraction_level,
+                          full_broken=False, extraction_broken=False):
+    """Combine pre-31 full-backup rules with API 31+ extraction rules.
+
+    A missing document for an applicable API range is unrestricted. An
+    unreadable referenced document is ``unknown`` so the caller does not
+    treat it as a proven exclusion.
+    """
+    needs_full = min_level is None or min_level < 31
+    needs_extraction = target_level is None or target_level >= 31
+    if needs_full and full_broken:
+        return "unknown"
+    if needs_extraction and extraction_broken:
+        return "unknown"
+    levels = []
+    if needs_full:
+        levels.append(full_level or "open")
+    if needs_extraction:
+        levels.append(extraction_level or "open")
+    return _worst_backup_level(levels)
+
+
+# Markers are case-sensitive smali/XML substrings. Class references use the
+# ``;``, ``->``, and ``$`` forms so a longer type (CameraProfile,
+# AudioRecordingConfiguration) does not match. Keep SMS and storage markers
+# disjoint: one call must not mark a sibling permission as used.
+_ACTION_CALL_RE = re.compile(
+    r"android\.intent\.action\.CALL(?![A-Za-z0-9_])"
+)
+_ACTION_INSTALL_PACKAGE_RE = re.compile(
+    r"android\.intent\.action\.INSTALL_PACKAGE(?![A-Za-z0-9_])"
+)
+_ACTION_NEW_OUTGOING_CALL_RE = re.compile(
+    r"android\.intent\.action\.NEW_OUTGOING_CALL(?![A-Za-z0-9_])"
+)
+_SMS_RECEIVED_ACTION_RE = re.compile(
+    r"android\.provider\.Telephony\.SMS_RECEIVED(?![A-Za-z0-9_])"
+)
+
+PERMISSION_API_RULES = (
+    {
+        # Background location has no distinct platform call. A foreground
+        # location API counts as use, so the background permission is not
+        # reported unused when those calls are present.
+        "id": "location",
+        "label": "location",
+        "permissions": (
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+        ),
+        "markers": (
+            "Landroid/location/LocationManager;->getLastKnownLocation(",
+            "Landroid/location/LocationManager;->requestLocationUpdates(",
+            "Landroid/location/LocationManager;->requestSingleUpdate(",
+            "Landroid/location/LocationManager;->getCurrentLocation(",
+            "Lcom/google/android/gms/location/FusedLocationProviderClient;",
+            "Lcom/google/android/gms/location/FusedLocationProviderClient;->",
+            "Lcom/google/android/gms/location/FusedLocationProviderClient$",
+        ),
+    },
+    {
+        "id": "phone_state",
+        "label": "phone state",
+        "permissions": ("android.permission.READ_PHONE_STATE",),
+        "markers": (
+            "Landroid/telephony/TelephonyManager;",
+            "Landroid/telephony/TelephonyManager;->",
+            "Landroid/telephony/TelephonyManager$",
+        ),
+    },
+    {
+        "id": "camera",
+        "label": "camera",
+        "permissions": ("android.permission.CAMERA",),
+        "markers": (
+            "Landroid/hardware/Camera;",
+            "Landroid/hardware/Camera;->",
+            "Landroid/hardware/Camera$",
+            "Landroid/hardware/camera2/",
+        ),
+    },
+    {
+        "id": "contacts",
+        "label": "contacts",
+        "permissions": (
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_CONTACTS",
+        ),
+        "markers": (
+            "Landroid/provider/ContactsContract;",
+            "Landroid/provider/ContactsContract;->",
+            "Landroid/provider/ContactsContract$",
+        ),
+    },
+    {
+        # Telephony$Sms$Intents is the receive path and must not satisfy
+        # READ_SMS. Send methods are likewise not reads or receives.
+        "id": "sms_read",
+        "label": "SMS reading",
+        "permissions": ("android.permission.READ_SMS",),
+        "markers": (
+            "Landroid/provider/Telephony$Sms;->",
+            "Landroid/provider/Telephony$Sms;",
+            "Landroid/provider/Telephony$Sms$Inbox",
+            "Landroid/provider/Telephony$Sms$Sent",
+            "Landroid/provider/Telephony$Sms$Draft",
+            "Landroid/provider/Telephony$Sms$Outbox",
+            "Landroid/provider/Telephony$Sms$Conversations",
+        ),
+    },
+    {
+        "id": "sms_receive",
+        "label": "SMS receiving",
+        "permissions": ("android.permission.RECEIVE_SMS",),
+        "markers": (
+            "Landroid/provider/Telephony$Sms$Intents;->SMS_RECEIVED_ACTION",
+            "Landroid/telephony/SmsMessage;->createFromPdu(",
+            "Landroid/telephony/gsm/SmsMessage;->createFromPdu(",
+        ),
+        "patterns": (_SMS_RECEIVED_ACTION_RE,),
+    },
+    {
+        "id": "sms_send",
+        "label": "SMS sending",
+        "permissions": ("android.permission.SEND_SMS",),
+        "markers": (
+            "Landroid/telephony/SmsManager;->sendTextMessage(",
+            "Landroid/telephony/SmsManager;->sendMultipartTextMessage(",
+            "Landroid/telephony/SmsManager;->sendDataMessage(",
+            "Landroid/telephony/gsm/SmsManager;->sendTextMessage(",
+            "Landroid/telephony/gsm/SmsManager;->sendMultipartTextMessage(",
+            "Landroid/telephony/gsm/SmsManager;->sendDataMessage(",
+        ),
+    },
+    {
+        "id": "record_audio",
+        "label": "audio recording",
+        "permissions": ("android.permission.RECORD_AUDIO",),
+        "markers": (
+            "Landroid/media/AudioRecord;",
+            "Landroid/media/AudioRecord;->",
+            "Landroid/media/AudioRecord$",
+            "Landroid/media/MediaRecorder;->setAudioSource(",
+            "Landroid/speech/SpeechRecognizer;",
+            "Landroid/speech/SpeechRecognizer;->",
+            "Landroid/speech/SpeechRecognizer$",
+        ),
+    },
+    {
+        # READ_EXTERNAL_STORAGE still covers media on older targets.
+        "id": "media_images",
+        "label": "image media",
+        "permissions": (
+            "android.permission.READ_MEDIA_IMAGES",
+            "android.permission.READ_EXTERNAL_STORAGE",
+        ),
+        "markers": (
+            "Landroid/provider/MediaStore$Images;",
+            "Landroid/provider/MediaStore$Images$",
+        ),
+    },
+    {
+        "id": "media_video",
+        "label": "video media",
+        "permissions": (
+            "android.permission.READ_MEDIA_VIDEO",
+            "android.permission.READ_EXTERNAL_STORAGE",
+        ),
+        "markers": (
+            "Landroid/provider/MediaStore$Video;",
+            "Landroid/provider/MediaStore$Video$",
+        ),
+    },
+    {
+        "id": "media_audio",
+        "label": "audio media",
+        "permissions": (
+            "android.permission.READ_MEDIA_AUDIO",
+            "android.permission.READ_EXTERNAL_STORAGE",
+        ),
+        "markers": (
+            "Landroid/provider/MediaStore$Audio;",
+            "Landroid/provider/MediaStore$Audio$",
+        ),
+    },
+    {
+        # Directory APIs are covered by read, write, or all-files access.
+        # isExternalStorageManager stays on the manage-only rule below.
+        "id": "external_storage",
+        "label": "external storage",
+        "permissions": (
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE",
+            "android.permission.MANAGE_EXTERNAL_STORAGE",
+        ),
+        "markers": (
+            "Landroid/os/Environment;->getExternalStorageDirectory(",
+            "Landroid/os/Environment;->getExternalStoragePublicDirectory(",
+        ),
+    },
+    {
+        "id": "install_packages",
+        "label": "package installation",
+        "permissions": ("android.permission.REQUEST_INSTALL_PACKAGES",),
+        "markers": (
+            "Landroid/content/pm/PackageInstaller;",
+            "Landroid/content/pm/PackageInstaller;->",
+            "Landroid/content/pm/PackageInstaller$",
+            "Landroid/content/Intent;->ACTION_INSTALL_PACKAGE:",
+        ),
+        "patterns": (_ACTION_INSTALL_PACKAGE_RE,),
+    },
+    {
+        "id": "system_alert",
+        "label": "system overlay",
+        "permissions": ("android.permission.SYSTEM_ALERT_WINDOW",),
+        "markers": (
+            "Landroid/view/WindowManager$LayoutParams;->TYPE_APPLICATION_OVERLAY:",
+            "Landroid/view/WindowManager$LayoutParams;->TYPE_SYSTEM_ALERT:",
+            "Landroid/provider/Settings;->canDrawOverlays(",
+        ),
+    },
+    {
+        "id": "call_phone",
+        "label": "phone calls",
+        "permissions": ("android.permission.CALL_PHONE",),
+        "markers": ("Landroid/content/Intent;->ACTION_CALL:",),
+        "patterns": (_ACTION_CALL_RE,),
+    },
+    {
+        "id": "call_log",
+        "label": "call log",
+        "permissions": (
+            "android.permission.READ_CALL_LOG",
+            "android.permission.WRITE_CALL_LOG",
+        ),
+        "markers": (
+            "Landroid/provider/CallLog;",
+            "Landroid/provider/CallLog;->",
+            "Landroid/provider/CallLog$",
+        ),
+    },
+    {
+        "id": "outgoing_calls",
+        "label": "outgoing calls",
+        "permissions": ("android.permission.PROCESS_OUTGOING_CALLS",),
+        "markers": ("Landroid/content/Intent;->ACTION_NEW_OUTGOING_CALL:",),
+        "patterns": (_ACTION_NEW_OUTGOING_CALL_RE,),
+    },
+    {
+        "id": "calendar",
+        "label": "calendar",
+        "permissions": (
+            "android.permission.READ_CALENDAR",
+            "android.permission.WRITE_CALENDAR",
+        ),
+        "markers": (
+            "Landroid/provider/CalendarContract;",
+            "Landroid/provider/CalendarContract;->",
+            "Landroid/provider/CalendarContract$",
+        ),
+    },
+    {
+        # TYPE_HEART_RATE only. SensorManager itself is not body-sensor use.
+        "id": "body_sensors",
+        "label": "body sensors",
+        "permissions": ("android.permission.BODY_SENSORS",),
+        "markers": ("Landroid/hardware/Sensor;->TYPE_HEART_RATE:",),
+    },
+    {
+        "id": "manage_storage",
+        "label": "all-files access",
+        "permissions": ("android.permission.MANAGE_EXTERNAL_STORAGE",),
+        "markers": (
+            "Landroid/os/Environment;->isExternalStorageManager(",
+            "android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION",
+            "Landroid/provider/Settings;->ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION",
+        ),
+    },
+    {
+        "id": "nearby_wifi",
+        "label": "nearby Wi-Fi",
+        "permissions": ("android.permission.NEARBY_WIFI_DEVICES",),
+        "min_target": 33,
+        "markers": (
+            "Landroid/net/wifi/aware/",
+            "Landroid/net/wifi/rtt/",
+            "Landroid/net/wifi/p2p/",
+            "Landroid/net/wifi/WifiNetworkSpecifier;",
+            "Landroid/net/wifi/WifiNetworkSpecifier;->",
+            "Landroid/net/wifi/WifiNetworkSpecifier$",
+        ),
+    },
+    {
+        "id": "post_notifications",
+        "label": "notification posting",
+        "permissions": ("android.permission.POST_NOTIFICATIONS",),
+        "min_target": 33,
+        "markers": (
+            "Landroid/app/NotificationManager;->notify(",
+            "Landroid/app/NotificationManager;->notifyAsPackage(",
+            "Landroid/app/NotificationManager;->notifyAsUser(",
+            "Landroidx/core/app/NotificationManagerCompat;->notify(",
+        ),
+    },
+)
+
+
+def _permission_text_matches(rule, text):
+    """Return whether one mapped API marker appears in *text*."""
+    for marker in rule["markers"]:
+        if marker in text:
+            return True
+    for pattern in rule.get("patterns", ()):
+        if pattern.search(text):
+            return True
+    return False
+
+
+def match_permission_apis(text):
+    """Return rule ids whose mapped platform API appears in *text*.
+
+    The match is a substring/regex scan of one smali or XML document, not a
+    proof that the call is reachable.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    return [
+        rule["id"] for rule in PERMISSION_API_RULES
+        if _permission_text_matches(rule, text)
+    ]
+
+
+def _permission_names(values):
+    """Return a set of permission or rule-id strings."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = (values,)
+    names = set()
+    for item in values:
+        text = str(item).strip()
+        if text:
+            names.add(text)
+    return names
+
+
+def _permission_api_required(rule, target_level):
+    """Return whether a missing declaration of *rule* is meaningful.
+
+    Permissions added in API 33 are not required when targetSdk is known and
+    lower. An unknown target fails closed and still requires them.
+    """
+    minimum = rule.get("min_target")
+    if minimum is None:
+        return True
+    if target_level is None:
+        return True
+    try:
+        level = int(target_level)
+    except (TypeError, ValueError):
+        return True
+    return level >= int(minimum)
+
+
+def correlate_permission_apis(declared_permissions, matched_rule_ids,
+                              code_coverage_complete,
+                              split_manifest_coverage_complete,
+                              target_level=None):
+    """Pair dangerous permissions with mapped platform APIs.
+
+    ``unused_permissions`` is an absence claim: it stays empty unless
+    smali/XML coverage is complete. ``missing_rules`` is positive evidence
+    of an API, but it stays empty when split-manifest coverage is incomplete
+    because the permission may exist only in a split that was not merged.
+    Callers still withhold a clean pass when the other coverage axis is
+    incomplete.
+
+    POST_NOTIFICATIONS and NEARBY_WIFI_DEVICES produce a missing-permission
+    result only when targetSdk is unknown or at least 33. A declaration with
+    no mapped API is still reported as unused at any target. Dangerous
+    permissions that have no rule are never called unused.
+    """
+    declared = _permission_names(declared_permissions)
+    matched = _permission_names(matched_rule_ids)
+    rules_for_permission = {}
+    for rule in PERMISSION_API_RULES:
+        for permission in rule["permissions"]:
+            rules_for_permission.setdefault(permission, []).append(rule)
+
+    unmatched = []
+    for permission in sorted(rules_for_permission):
+        if permission not in declared:
+            continue
+        covering = rules_for_permission[permission]
+        if any(rule["id"] in matched for rule in covering):
+            continue
+        unmatched.append(permission)
+
+    candidate_rules = []
+    for rule in PERMISSION_API_RULES:
+        if rule["id"] not in matched:
+            continue
+        if any(permission in declared for permission in rule["permissions"]):
+            continue
+        if not _permission_api_required(rule, target_level):
+            continue
+        candidate_rules.append({
+            "id": rule["id"],
+            "label": rule["label"],
+            "permissions": rule["permissions"],
+        })
+
+    code_complete = bool(code_coverage_complete)
+    split_complete = bool(split_manifest_coverage_complete)
+    return {
+        "unused_permissions": list(unmatched) if code_complete else [],
+        "unmatched_permissions": list(unmatched),
+        "missing_rules": list(candidate_rules) if split_complete else [],
+        "uncovered_rules": [] if split_complete else list(candidate_rules),
+        "unused_inconclusive": (not code_complete) and bool(unmatched),
+        "missing_inconclusive": (
+            (not split_complete) and bool(candidate_rules)
+        ),
+    }
+
+
 def classify_deep_link(link):
     """Classify one externally reachable deep-link intent filter.
 

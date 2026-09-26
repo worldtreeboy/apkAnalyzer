@@ -17,7 +17,7 @@ def write_safe_manifest(root):
     Path(root, "AndroidManifest.xml").write_text(
         f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="{ANDROID_NS}" package="com.example.coverage">
-  <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="35"/>
+  <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="36"/>
   <application android:debuggable="false" android:allowBackup="false"
                android:usesCleartextTraffic="false"/>
 </manifest>''',

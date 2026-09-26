@@ -39,6 +39,16 @@ class CoreModuleBoundaryTests(unittest.TestCase):
         self.assertEqual(analyzer.TOOL_VERSION, apk_analyzer.TOOL_VERSION)
         self.assertEqual(apk_analyzer.__version__, analyzer.TOOL_VERSION)
 
+    def test_feature_modules_bind_into_the_launcher_namespace(self):
+        self.assertIs(analyzer.security_scan.__globals__, vars(analyzer))
+        self.assertEqual(analyzer.security_scan.__module__, "apkAnalyzer")
+        self.assertEqual(
+            os.path.basename(analyzer.security_scan.__code__.co_filename),
+            "scan.py",
+        )
+        self.assertIs(analyzer._pull_and_decompile.__globals__, vars(analyzer))
+        self.assertIs(analyzer.runtime_security_check.__globals__, vars(analyzer))
+
     def test_archive_defaults_have_one_source_and_legacy_aliases(self):
         self.assertEqual(analyzer.MAX_BACKUP_BYTES,
                          archive.DEFAULT_MAX_BACKUP_BYTES)
